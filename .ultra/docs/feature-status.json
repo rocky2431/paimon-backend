@@ -1,1 +1,13 @@
-{"features":[]}
+{
+  "features": [
+    {
+      "id": "feat-1",
+      "name": "Initialize FastAPI project structure",
+      "status": "pending",
+      "taskId": "1",
+      "implementedAt": "2024-12-13T08:52:00Z",
+      "commit": "4deaac8",
+      "branch": "main"
+    }
+  ]
+}
