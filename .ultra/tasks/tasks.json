@@ -31,10 +31,12 @@
       "priority": "P0",
       "dependencies": ["1"],
       "estimated_days": 1,
-      "status": "pending",
+      "status": "completed",
       "type": "architecture",
       "trace_to": "specs/product.md#phase-1-infrastructure",
-      "phase": 1
+      "phase": 1,
+      "completedAt": "2024-12-13T08:55:00Z",
+      "commit": "31c734a"
     },
     {
       "id": "3",
@@ -416,9 +418,9 @@
   ],
   "metadata": {
     "totalTasks": 31,
-    "completedTasks": 1,
+    "completedTasks": 2,
     "inProgressTasks": 0,
-    "pendingTasks": 30,
+    "pendingTasks": 29,
     "totalEstimatedDays": 80,
     "byPriority": {
       "P0": 14,
