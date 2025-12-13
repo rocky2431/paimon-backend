@@ -19,6 +19,14 @@ from app.services.forecasting import (
 class TestRiskDashboard:
     """Tests for risk dashboard endpoint."""
 
+    @pytest.fixture(autouse=True)
+    def reset_risk_service(self):
+        """Reset risk service before each test."""
+        import app.services.risk.monitor as monitor_module
+        monitor_module._risk_service = None
+        yield
+        monitor_module._risk_service = None
+
     def test_get_dashboard_empty(self):
         """Test dashboard with no assessments."""
         from app.api.v1.endpoints.risk import get_risk_dashboard
