@@ -8,10 +8,12 @@ from app.api.v1.endpoints import (
     auth,
     fund,
     health,
+    metrics,
     rebalancing,
     redemptions,
     reports,
     risk,
+    security,
     websocket,
 )
 
@@ -28,3 +30,5 @@ api_router.include_router(reports.router)
 api_router.include_router(websocket.router)
 api_router.include_router(audit.router)
 api_router.include_router(health.router)
+api_router.include_router(metrics.router)
+api_router.include_router(security.router)
