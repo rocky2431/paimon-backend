@@ -61,10 +61,12 @@
       "priority": "P0",
       "dependencies": ["3"],
       "estimated_days": 2,
-      "status": "pending",
+      "status": "completed",
       "type": "architecture",
       "trace_to": "specs/architecture.md#database-design",
-      "phase": 1
+      "phase": 1,
+      "completedAt": "2024-12-13T09:10:00Z",
+      "commit": "14f201e"
     },
     {
       "id": "5",
@@ -420,9 +422,9 @@
   ],
   "metadata": {
     "totalTasks": 31,
-    "completedTasks": 3,
+    "completedTasks": 4,
     "inProgressTasks": 0,
-    "pendingTasks": 28,
+    "pendingTasks": 27,
     "totalEstimatedDays": 80,
     "byPriority": {
       "P0": 14,
