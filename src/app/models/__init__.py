@@ -7,6 +7,12 @@ from app.models.base import Base, TimestampMixin
 from app.models.rebalance import RebalanceHistory
 from app.models.redemption import RedemptionRequest
 from app.models.risk import RiskEvent
+from app.models.timeseries import (
+    AssetHoldingsSnapshot,
+    DailySnapshot,
+    EventProcessingLog,
+    RiskMetricsSeries,
+)
 from app.models.transaction import Transaction
 
 __all__ = [
@@ -23,4 +29,9 @@ __all__ = [
     # Monitoring models
     "RiskEvent",
     "AuditLog",
+    # TimescaleDB time-series models
+    "DailySnapshot",
+    "AssetHoldingsSnapshot",
+    "RiskMetricsSeries",
+    "EventProcessingLog",
 ]
