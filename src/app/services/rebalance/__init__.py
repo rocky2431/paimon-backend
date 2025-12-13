@@ -1,5 +1,22 @@
 """Rebalancing strategy service module."""
 
+from app.services.rebalance.executor import (
+    RebalanceExecutor,
+    get_rebalance_executor,
+)
+from app.services.rebalance.executor_schemas import (
+    ExecutionConfig,
+    ExecutionContext,
+    ExecutionResult,
+    ExecutionStatus,
+    RetryPolicy,
+    SimulationResult,
+    TransactionRecord,
+    TransactionRequest,
+    TransactionStatus,
+    WalletConfig,
+    WalletTier,
+)
 from app.services.rebalance.schemas import (
     LiquidityTier,
     RebalanceAction,
@@ -22,13 +39,27 @@ __all__ = [
     "RebalanceDirection",
     "RebalanceAction",
     "RebalanceStatus",
-    # Schemas
+    "WalletTier",
+    "TransactionStatus",
+    "ExecutionStatus",
+    # Strategy Schemas
     "TierConfig",
     "TierState",
     "TierDeviation",
     "RebalancePlanStep",
     "RebalancePlan",
-    # Engine
+    # Execution Schemas
+    "WalletConfig",
+    "SimulationResult",
+    "TransactionRequest",
+    "TransactionRecord",
+    "ExecutionContext",
+    "ExecutionResult",
+    "RetryPolicy",
+    "ExecutionConfig",
+    # Engines
     "RebalanceStrategyEngine",
     "get_rebalance_strategy_engine",
+    "RebalanceExecutor",
+    "get_rebalance_executor",
 ]
