@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import approvals, auth, redemptions
+from app.api.v1.endpoints import approvals, auth, rebalancing, redemptions
 
 api_router = APIRouter(prefix="/v1")
 
@@ -10,3 +10,4 @@ api_router = APIRouter(prefix="/v1")
 api_router.include_router(auth.router)
 api_router.include_router(redemptions.router)
 api_router.include_router(approvals.router)
+api_router.include_router(rebalancing.router)

@@ -32,6 +32,14 @@ from app.services.rebalance.strategy import (
     RebalanceStrategyEngine,
     get_rebalance_strategy_engine,
 )
+from app.services.rebalance.triggers import (
+    RebalanceTriggerService,
+    TriggerConfig,
+    TriggerHistory,
+    TriggerResult,
+    TriggerType,
+    get_trigger_service,
+)
 
 __all__ = [
     # Enums
@@ -62,4 +70,11 @@ __all__ = [
     "get_rebalance_strategy_engine",
     "RebalanceExecutor",
     "get_rebalance_executor",
+    # Triggers
+    "RebalanceTriggerService",
+    "TriggerConfig",
+    "TriggerHistory",
+    "TriggerResult",
+    "TriggerType",
+    "get_trigger_service",
 ]
