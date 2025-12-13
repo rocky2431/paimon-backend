@@ -48,6 +48,14 @@ class Settings(BaseSettings):
     redis_db: int = Field(default=0, description="Redis database number")
     redis_password: str | None = Field(default=None, description="Redis password")
 
+    # JWT Authentication
+    access_token_expire_minutes: int = Field(
+        default=30, description="Access token expiration in minutes"
+    )
+    refresh_token_expire_days: int = Field(
+        default=7, description="Refresh token expiration in days"
+    )
+
     # Blockchain
     bsc_rpc_url: str = Field(
         default="https://bsc-dataseed.binance.org/",
@@ -59,6 +67,16 @@ class Settings(BaseSettings):
             "https://bsc-dataseed1.ninicoin.io/",
         ],
         description="Backup BSC RPC endpoints",
+    )
+
+    # Contract Addresses
+    vault_contract_address: str = Field(
+        default="0x0000000000000000000000000000000000000000",
+        description="Vault contract address",
+    )
+    redemption_manager_address: str = Field(
+        default="0x0000000000000000000000000000000000000000",
+        description="Redemption manager contract address",
     )
 
     # Logging
