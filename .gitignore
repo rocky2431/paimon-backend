@@ -1,0 +1,103 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Mypy
+.mypy_cache/
+
+# Environments
+.env
+.env.local
+.env.*.local
+*.env
+
+# Secrets (NEVER commit these)
+secrets/
+*.pem
+*.key
+credentials.json
+service-account.json
+
+# Database
+*.db
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Coverage reports
+coverage.xml
+*.cover
+
+# Ultra Builder Pro
+.ultra/context-archive/*.md
+!.ultra/context-archive/README.md
+!.ultra/context-archive/session-index.json
+
+# Build artifacts
+*.pyc
+*.pyo
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Documentation builds
+docs/_build/
+
+# Alembic
+alembic/versions/__pycache__/
+migrations/versions/__pycache__/
+
+# Ruff
+.ruff_cache/
+
+# Secrets baseline
+.secrets.baseline

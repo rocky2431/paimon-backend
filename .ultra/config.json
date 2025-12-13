@@ -1,0 +1,122 @@
+{
+  "version": "4.2",
+  "project": {
+    "name": "paimon-backend",
+    "type": ["api"],
+    "stack": ["Python 3.11+", "FastAPI", "SQLAlchemy 2.x", "PostgreSQL 16", "TimescaleDB", "Redis 7.x", "Celery", "web3.py"],
+    "created": "2024-12-13T16:30:00Z",
+    "detectionContext": {
+      "frameworks": {
+        "frontend": [],
+        "backend": ["FastAPI", "SQLAlchemy", "Celery", "APScheduler"],
+        "testing": ["pytest"],
+        "buildTools": ["Alembic"]
+      },
+      "packageManager": "pip",
+      "hasTests": false,
+      "hasCI": false,
+      "hasGit": true,
+      "detectedStacks": ["Python", "FastAPI", "PostgreSQL", "Redis", "TimescaleDB"]
+    }
+  },
+  "structure": "specs",
+
+  "context": {
+    "total_limit": 200000,
+    "thresholds": {
+      "green": 0.60,
+      "yellow": 0.70,
+      "orange": 0.85,
+      "red": 0.95
+    },
+    "compression": {
+      "trigger_task_count": 5,
+      "target_ratio": 0.10,
+      "archive_path": ".ultra/context-archive/"
+    }
+  },
+
+  "quality_gates": {
+    "test_coverage": {
+      "overall": 0.80,
+      "critical_paths": 1.00,
+      "branch": 0.75,
+      "function": 0.85
+    },
+    "code_quality": {
+      "max_function_lines": 50,
+      "max_nesting_depth": 3,
+      "max_complexity": 10,
+      "max_duplication_lines": 3
+    },
+    "performance": {
+      "api_p99_ms": 500,
+      "event_processing_delay_s": 30,
+      "availability_sla": 0.999
+    }
+  },
+
+  "git": {
+    "branch_patterns": {
+      "feature": "feat/task-{id}-{slug}",
+      "bugfix": "fix/bug-{id}-{slug}",
+      "refactor": "refactor/{slug}",
+      "docs": "docs/{slug}",
+      "test": "test/{slug}"
+    },
+    "commit": {
+      "convention": "conventional-commits",
+      "co_author": "Claude <noreply@anthropic.com>"
+    },
+    "workflow": {
+      "strategy": "independent",
+      "auto_branch_naming": true,
+      "merge_strategy": "no-ff"
+    }
+  },
+
+  "paths": {
+    "tasks": ".ultra/tasks/tasks.json",
+    "specs": {
+      "product": ".ultra/specs/product.md",
+      "architecture": ".ultra/specs/architecture.md"
+    },
+    "docs_legacy": {
+      "prd": ".ultra/docs/prd.md",
+      "tech": ".ultra/docs/tech.md"
+    },
+    "research": ".ultra/docs/research/",
+    "decisions": ".ultra/docs/decisions/",
+    "context_archive": ".ultra/context-archive/",
+    "changes": ".ultra/changes/",
+    "backend_docs": "docs/backend/"
+  },
+
+  "tools": {
+    "mcp": {
+      "context7": true,
+      "exa": true
+    },
+    "skills": {
+      "guarding-code-quality": true,
+      "guarding-test-coverage": true,
+      "guarding-git-safety": true,
+      "guarding-ui-design": false,
+      "syncing-docs": true,
+      "automating-e2e-tests": false,
+      "compressing-context": true,
+      "guiding-workflow": true,
+      "enforcing-workflow": true
+    }
+  },
+
+  "blockchain": {
+    "network": "BSC",
+    "rpc_providers": ["QuickNode", "Alchemy", "Self-hosted"],
+    "contracts": {
+      "vault": "PNGYVault",
+      "redemption_manager": "RedemptionManager",
+      "asset_controller": "AssetController"
+    }
+  }
+}

@@ -1,0 +1,46 @@
+# Paimon Backend - Production Dependencies
+# Python 3.11+
+
+# Web Framework
+fastapi>=0.109.0,<1.0.0
+uvicorn[standard]>=0.27.0,<1.0.0
+gunicorn>=21.2.0,<22.0.0
+
+# Configuration
+pydantic>=2.5.0,<3.0.0
+pydantic-settings>=2.1.0,<3.0.0
+
+# Database
+sqlalchemy[asyncio]>=2.0.25,<3.0.0
+asyncpg>=0.29.0,<1.0.0
+psycopg2-binary>=2.9.9,<3.0.0
+alembic>=1.13.0,<2.0.0
+
+# Cache
+redis>=5.0.0,<6.0.0
+
+# Task Queue
+celery[redis]>=5.3.0,<6.0.0
+
+# Scheduler
+apscheduler>=3.10.0,<4.0.0
+
+# Blockchain
+web3>=6.15.0,<7.0.0
+
+# Logging
+structlog>=24.1.0,<25.0.0
+
+# HTTP Client
+httpx>=0.26.0,<1.0.0
+
+# Utilities
+python-multipart>=0.0.6,<1.0.0
+python-jose[cryptography]>=3.3.0,<4.0.0
+passlib[bcrypt]>=1.7.4,<2.0.0
+
+# Monitoring
+prometheus-client>=0.19.0,<1.0.0
+opentelemetry-api>=1.22.0,<2.0.0
+opentelemetry-sdk>=1.22.0,<2.0.0
+opentelemetry-instrumentation-fastapi>=0.43b0
