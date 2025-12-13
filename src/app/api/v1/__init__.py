@@ -2,7 +2,18 @@
 
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import approvals, auth, fund, rebalancing, redemptions, reports, risk
+from app.api.v1.endpoints import (
+    approvals,
+    audit,
+    auth,
+    fund,
+    health,
+    rebalancing,
+    redemptions,
+    reports,
+    risk,
+    websocket,
+)
 
 api_router = APIRouter()
 
@@ -14,3 +25,6 @@ api_router.include_router(rebalancing.router)
 api_router.include_router(risk.router)
 api_router.include_router(fund.router)
 api_router.include_router(reports.router)
+api_router.include_router(websocket.router)
+api_router.include_router(audit.router)
+api_router.include_router(health.router)
