@@ -1,0 +1,61 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv
+ENV
+env
+
+# Testing
+.pytest_cache
+.coverage
+htmlcov
+coverage.xml
+.tox
+.nox
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Build
+build
+dist
+*.egg-info
+
+# Documentation
+docs/_build
+*.md
+
+# Local config
+.env
+.env.*
+*.env
+
+# Docker
+Dockerfile
+docker-compose*.yml
+
+# Ultra Builder Pro
+.ultra
+
+# Misc
+*.log
+logs
+.DS_Store
+Thumbs.db
+
+# Secrets
+secrets
+*.pem
+*.key
+credentials.json
