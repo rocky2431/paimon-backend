@@ -100,12 +100,13 @@
       "complexity": 5,
       "priority": "P0",
       "dependencies": ["1"],
-      "status": "pending",
+      "status": "completed",
       "type": "architecture",
       "phase": "A",
       "trace_to": "docs/backend/06-database-design.md#4.4",
       "isNewTask": true,
-      "blockingReason": "No task queue exists. Event processing, SLA timers, and scheduled tasks all require Celery."
+      "completedAt": "2024-12-15T11:00:00Z",
+      "evidence": "src/app/core/celery_app.py (config + beat schedule), src/app/tasks/ (event_tasks, approval_tasks, rebalance_tasks, monitoring_tasks, notification_tasks), scripts/celery_*.sh (worker/beat/flower startup)"
     },
     {
       "id": "5",
@@ -513,14 +514,14 @@
   ],
   "metadata": {
     "totalTasks": 35,
-    "completedTasks": 6,
+    "completedTasks": 7,
     "prototypeTasks": 22,
-    "pendingNewTasks": 7,
-    "actualProductionReady": "~18%",
+    "pendingNewTasks": 6,
+    "actualProductionReady": "~20%",
     "byStatus": {
-      "completed": 6,
+      "completed": 7,
       "prototype": 22,
-      "pending": 7
+      "pending": 6
     },
     "criticalNewTasks": ["NEW-A1", "NEW-A2", "NEW-A3", "NEW-B1", "NEW-B2", "NEW-B3", "NEW-B4"],
     "criticalPath": ["NEW-A1", "NEW-A2", "NEW-B1", "NEW-B2", "NEW-B3", "30", "31"],
