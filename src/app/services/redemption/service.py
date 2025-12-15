@@ -1,11 +1,26 @@
-"""Redemption management service."""
+"""Redemption management service with database persistence.
+
+Provides full lifecycle management for redemption requests:
+- Create from blockchain events
+- List with filters and pagination
+- Detail view with timeline
+- Approval/rejection operations
+- Manual settlement trigger
+"""
 
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
 
+from sqlalchemy import func, select, and_
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.infrastructure.database.session import AsyncSessionLocal
+from app.models.redemption import RedemptionRequest
+from app.repositories.redemption import RedemptionRepository
+from app.repositories.audit_log import AuditLogRepository
 from app.services.redemption.schemas import (
     ApprovalRequest,
     PaginationMeta,
@@ -41,130 +56,93 @@ class RedemptionStats:
     total_volume: Decimal = field(default_factory=lambda: Decimal(0))
 
 
-@dataclass
-class InMemoryRedemption:
-    """In-memory redemption record for testing."""
-
-    id: int
-    request_id: Decimal
-    tx_hash: str
-    block_number: int
-    log_index: int
-    owner: str
-    receiver: str
-    shares: Decimal
-    gross_amount: Decimal
-    locked_nav: Decimal
-    estimated_fee: Decimal
-    request_time: datetime
-    settlement_time: datetime
-    status: RedemptionStatus
-    channel: RedemptionChannel
-    requires_approval: bool
-    window_id: Decimal | None = None
-    actual_fee: Decimal | None = None
-    net_amount: Decimal | None = None
-    settlement_tx_hash: str | None = None
-    settled_at: datetime | None = None
-    approval_ticket_id: str | None = None
-    approved_by: str | None = None
-    approved_at: datetime | None = None
-    rejected_by: str | None = None
-    rejected_at: datetime | None = None
-    rejection_reason: str | None = None
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    timeline_events: list[dict[str, Any]] = field(default_factory=list)
-
-
 class RedemptionService:
-    """Service for managing redemption requests.
+    """Service for managing redemption requests with database persistence.
 
     Provides:
     - Listing with filters and pagination
     - Detail view with timeline
     - Approval/rejection operations
     - Manual settlement trigger
+    - Statistics and reporting
+
+    Uses Repository pattern for database operations.
     """
 
-    def __init__(self, repository: Any = None):
+    # Approval thresholds (USDC amounts)
+    EMERGENCY_APPROVAL_THRESHOLD = Decimal("30000")  # >30K USDC requires approval
+    STANDARD_APPROVAL_THRESHOLD = Decimal("100000")  # >100K USDC requires approval
+
+    def __init__(self, session_factory: Callable[[], AsyncSession] | None = None):
         """Initialize redemption service.
 
-        Args:
-            repository: Optional database repository
+        @param session_factory - Optional factory for creating database sessions
         """
-        self.repository = repository
-        self._redemptions: dict[int, InMemoryRedemption] = {}
-        self._next_id = 1
+        self._session_factory = session_factory or AsyncSessionLocal
 
     async def create_redemption(self, data: RedemptionCreate) -> int:
-        """Create a new redemption request.
+        """Create a new redemption request in database.
 
-        Args:
-            data: Redemption creation data
-
-        Returns:
-            Created redemption ID
+        @param data - Redemption creation data from blockchain event
+        @returns Created redemption database ID
         """
-        redemption_id = self._next_id
-        self._next_id += 1
+        async with self._session_factory() as session:
+            repo = RedemptionRepository(session)
+            audit_repo = AuditLogRepository(session)
 
-        initial_status = (
-            RedemptionStatus.PENDING_APPROVAL
-            if data.requires_approval
-            else RedemptionStatus.PENDING
-        )
+            # Check if already exists (deduplication)
+            existing = await repo.get_by_tx_hash(data.tx_hash, data.log_index)
+            if existing:
+                logger.warning(
+                    f"Redemption already exists: tx={data.tx_hash}, log={data.log_index}"
+                )
+                return existing.id
 
-        redemption = InMemoryRedemption(
-            id=redemption_id,
-            request_id=data.request_id,
-            tx_hash=data.tx_hash,
-            block_number=data.block_number,
-            log_index=data.log_index,
-            owner=data.owner,
-            receiver=data.receiver,
-            shares=data.shares,
-            gross_amount=data.gross_amount,
-            locked_nav=data.locked_nav,
-            estimated_fee=data.estimated_fee,
-            request_time=data.request_time,
-            settlement_time=data.settlement_time,
-            status=initial_status,
-            channel=data.channel,
-            requires_approval=data.requires_approval,
-            window_id=data.window_id,
-        )
+            # Determine initial status based on approval requirement
+            initial_status = (
+                RedemptionStatus.PENDING_APPROVAL.value
+                if data.requires_approval
+                else RedemptionStatus.PENDING.value
+            )
 
-        # Add initial timeline event
-        redemption.timeline_events.append(
-            {
-                "event_type": "CREATED",
-                "timestamp": data.request_time,
-                "actor": data.owner,
+            # Create redemption record
+            redemption = await repo.create({
+                "request_id": data.request_id,
                 "tx_hash": data.tx_hash,
-                "details": {
+                "block_number": data.block_number,
+                "log_index": data.log_index,
+                "owner": data.owner.lower(),
+                "receiver": data.receiver.lower(),
+                "shares": data.shares,
+                "gross_amount": data.gross_amount,
+                "locked_nav": data.locked_nav,
+                "estimated_fee": data.estimated_fee,
+                "request_time": data.request_time,
+                "settlement_time": data.settlement_time,
+                "status": initial_status,
+                "channel": data.channel.value,
+                "requires_approval": data.requires_approval,
+                "window_id": data.window_id,
+            })
+
+            # Create audit log entry
+            await audit_repo.create({
+                "action": "redemption.created",
+                "resource_type": "redemption",
+                "resource_id": str(redemption.id),
+                "actor_address": data.owner.lower(),
+                "new_value": {
+                    "request_id": str(data.request_id),
                     "shares": str(data.shares),
                     "gross_amount": str(data.gross_amount),
                     "channel": data.channel.value,
+                    "requires_approval": data.requires_approval,
                 },
-            }
-        )
+            })
 
-        if data.requires_approval:
-            redemption.timeline_events.append(
-                {
-                    "event_type": "PENDING_APPROVAL",
-                    "timestamp": datetime.now(timezone.utc),
-                    "actor": None,
-                    "tx_hash": None,
-                    "details": {"reason": "Amount exceeds auto-approval threshold"},
-                }
-            )
-
-        self._redemptions[redemption_id] = redemption
-        logger.info(f"Created redemption {redemption_id} with status {initial_status}")
-
-        return redemption_id
+            await session.commit()
+            logger.info(f"Created redemption {redemption.id} with status {initial_status}")
+            return redemption.id
 
     async def list_redemptions(
         self,
@@ -176,155 +154,181 @@ class RedemptionService:
     ) -> RedemptionListResponse:
         """List redemptions with filters and pagination.
 
-        Args:
-            filters: Filter parameters
-            page: Page number (1-based)
-            page_size: Items per page
-            sort_by: Sort field
-            sort_order: Sort order
-
-        Returns:
-            Paginated list response
+        @param filters - Filter parameters
+        @param page - Page number (1-based)
+        @param page_size - Items per page
+        @param sort_by - Sort field
+        @param sort_order - Sort order
+        @returns Paginated list response
         """
-        # Apply filters
-        filtered = list(self._redemptions.values())
+        async with self._session_factory() as session:
+            # Build query with filters
+            conditions = []
 
-        if filters.status:
-            filtered = [r for r in filtered if r.status == filters.status]
+            if filters.status:
+                conditions.append(RedemptionRequest.status == filters.status.value)
 
-        if filters.channel:
-            filtered = [r for r in filtered if r.channel == filters.channel]
+            if filters.channel:
+                conditions.append(RedemptionRequest.channel == filters.channel.value)
 
-        if filters.owner:
-            filtered = [
-                r for r in filtered if r.owner.lower() == filters.owner.lower()
-            ]
+            if filters.owner:
+                conditions.append(
+                    RedemptionRequest.owner == filters.owner.lower()
+                )
 
-        if filters.requires_approval is not None:
-            filtered = [
-                r for r in filtered if r.requires_approval == filters.requires_approval
-            ]
+            if filters.requires_approval is not None:
+                conditions.append(
+                    RedemptionRequest.requires_approval == filters.requires_approval
+                )
 
-        if filters.from_date:
-            filtered = [r for r in filtered if r.request_time >= filters.from_date]
+            if filters.from_date:
+                conditions.append(RedemptionRequest.request_time >= filters.from_date)
 
-        if filters.to_date:
-            filtered = [r for r in filtered if r.request_time <= filters.to_date]
+            if filters.to_date:
+                conditions.append(RedemptionRequest.request_time <= filters.to_date)
 
-        if filters.min_amount:
-            filtered = [r for r in filtered if r.gross_amount >= filters.min_amount]
+            if filters.min_amount:
+                conditions.append(RedemptionRequest.gross_amount >= filters.min_amount)
 
-        if filters.max_amount:
-            filtered = [r for r in filtered if r.gross_amount <= filters.max_amount]
+            if filters.max_amount:
+                conditions.append(RedemptionRequest.gross_amount <= filters.max_amount)
 
-        # Sort
-        reverse = sort_order == SortOrder.DESC
-        sort_key = {
-            RedemptionSortField.REQUEST_TIME: lambda r: r.request_time,
-            RedemptionSortField.SETTLEMENT_TIME: lambda r: r.settlement_time,
-            RedemptionSortField.GROSS_AMOUNT: lambda r: r.gross_amount,
-            RedemptionSortField.STATUS: lambda r: r.status.value,
-        }.get(sort_by, lambda r: r.request_time)
+            # Base query
+            base_query = select(RedemptionRequest)
+            if conditions:
+                base_query = base_query.where(and_(*conditions))
 
-        filtered.sort(key=sort_key, reverse=reverse)
+            # Count total items
+            count_query = select(func.count()).select_from(base_query.subquery())
+            total_result = await session.execute(count_query)
+            total_items = total_result.scalar() or 0
 
-        # Paginate
-        total_items = len(filtered)
-        total_pages = (total_items + page_size - 1) // page_size if total_items > 0 else 0
-        start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        page_items = filtered[start_idx:end_idx]
-
-        # Convert to response models
-        items = [
-            RedemptionListItem(
-                id=r.id,
-                request_id=str(r.request_id),
-                tx_hash=r.tx_hash,
-                owner=r.owner,
-                receiver=r.receiver,
-                shares=str(r.shares),
-                gross_amount=str(r.gross_amount),
-                estimated_fee=str(r.estimated_fee),
-                channel=r.channel,
-                status=r.status,
-                requires_approval=r.requires_approval,
-                request_time=r.request_time,
-                settlement_time=r.settlement_time,
-                created_at=r.created_at,
+            # Sort
+            sort_column_map = {
+                RedemptionSortField.REQUEST_TIME: RedemptionRequest.request_time,
+                RedemptionSortField.SETTLEMENT_TIME: RedemptionRequest.settlement_time,
+                RedemptionSortField.GROSS_AMOUNT: RedemptionRequest.gross_amount,
+                RedemptionSortField.STATUS: RedemptionRequest.status,
+            }
+            sort_column = sort_column_map.get(
+                sort_by, RedemptionRequest.request_time
             )
-            for r in page_items
-        ]
 
-        return RedemptionListResponse(
-            items=items,
-            meta=PaginationMeta(
-                page=page,
-                page_size=page_size,
-                total_items=total_items,
-                total_pages=total_pages,
-            ),
-        )
+            if sort_order == SortOrder.DESC:
+                base_query = base_query.order_by(sort_column.desc())
+            else:
+                base_query = base_query.order_by(sort_column.asc())
+
+            # Paginate
+            offset = (page - 1) * page_size
+            base_query = base_query.offset(offset).limit(page_size)
+
+            result = await session.execute(base_query)
+            records = result.scalars().all()
+
+            # Calculate pagination
+            total_pages = (
+                (total_items + page_size - 1) // page_size if total_items > 0 else 0
+            )
+
+            # Convert to response models
+            items = [
+                RedemptionListItem(
+                    id=r.id,
+                    request_id=str(r.request_id),
+                    tx_hash=r.tx_hash,
+                    owner=r.owner,
+                    receiver=r.receiver,
+                    shares=str(r.shares),
+                    gross_amount=str(r.gross_amount),
+                    estimated_fee=str(r.estimated_fee),
+                    channel=RedemptionChannel(r.channel),
+                    status=RedemptionStatus(r.status),
+                    requires_approval=r.requires_approval,
+                    request_time=r.request_time,
+                    settlement_time=r.settlement_time,
+                    created_at=r.created_at,
+                )
+                for r in records
+            ]
+
+            return RedemptionListResponse(
+                items=items,
+                meta=PaginationMeta(
+                    page=page,
+                    page_size=page_size,
+                    total_items=total_items,
+                    total_pages=total_pages,
+                ),
+            )
 
     async def get_redemption_detail(self, redemption_id: int) -> RedemptionDetail | None:
         """Get detailed redemption information.
 
-        Args:
-            redemption_id: Redemption ID
-
-        Returns:
-            Redemption detail or None if not found
+        @param redemption_id - Redemption database ID
+        @returns Redemption detail or None if not found
         """
-        redemption = self._redemptions.get(redemption_id)
-        if not redemption:
-            return None
+        async with self._session_factory() as session:
+            repo = RedemptionRepository(session)
+            redemption = await repo.get_by_id(redemption_id)
 
-        # Build timeline
-        timeline = RedemptionTimeline(
-            events=[
-                RedemptionTimelineEvent(
-                    event_type=event["event_type"],
-                    timestamp=event["timestamp"],
-                    actor=event.get("actor"),
-                    tx_hash=event.get("tx_hash"),
-                    details=event.get("details"),
+            if not redemption:
+                return None
+
+            # Build timeline from audit logs
+            audit_repo = AuditLogRepository(session)
+            audit_logs = await audit_repo.get_by_resource(
+                resource_type="redemption",
+                resource_id=str(redemption_id)
+            )
+
+            timeline_events = []
+            for log in audit_logs:
+                event_type = log.action.replace("redemption.", "").upper()
+                timeline_events.append(
+                    RedemptionTimelineEvent(
+                        event_type=event_type,
+                        timestamp=log.created_at,
+                        actor=log.actor_address,
+                        tx_hash=log.new_value.get("tx_hash") if log.new_value else None,
+                        details=log.new_value,
+                    )
                 )
-                for event in redemption.timeline_events
-            ]
-        )
 
-        return RedemptionDetail(
-            id=redemption.id,
-            request_id=str(redemption.request_id),
-            tx_hash=redemption.tx_hash,
-            block_number=redemption.block_number,
-            log_index=redemption.log_index,
-            owner=redemption.owner,
-            receiver=redemption.receiver,
-            shares=str(redemption.shares),
-            gross_amount=str(redemption.gross_amount),
-            locked_nav=str(redemption.locked_nav),
-            estimated_fee=str(redemption.estimated_fee),
-            request_time=redemption.request_time,
-            settlement_time=redemption.settlement_time,
-            status=redemption.status,
-            channel=redemption.channel,
-            requires_approval=redemption.requires_approval,
-            window_id=str(redemption.window_id) if redemption.window_id else None,
-            actual_fee=str(redemption.actual_fee) if redemption.actual_fee else None,
-            net_amount=str(redemption.net_amount) if redemption.net_amount else None,
-            settlement_tx_hash=redemption.settlement_tx_hash,
-            settled_at=redemption.settled_at,
-            approval_ticket_id=redemption.approval_ticket_id,
-            approved_by=redemption.approved_by,
-            approved_at=redemption.approved_at,
-            rejected_by=redemption.rejected_by,
-            rejected_at=redemption.rejected_at,
-            rejection_reason=redemption.rejection_reason,
-            created_at=redemption.created_at,
-            updated_at=redemption.updated_at,
-            timeline=timeline,
-        )
+            timeline = RedemptionTimeline(events=timeline_events)
+
+            return RedemptionDetail(
+                id=redemption.id,
+                request_id=str(redemption.request_id),
+                tx_hash=redemption.tx_hash,
+                block_number=redemption.block_number,
+                log_index=redemption.log_index,
+                owner=redemption.owner,
+                receiver=redemption.receiver,
+                shares=str(redemption.shares),
+                gross_amount=str(redemption.gross_amount),
+                locked_nav=str(redemption.locked_nav),
+                estimated_fee=str(redemption.estimated_fee),
+                request_time=redemption.request_time,
+                settlement_time=redemption.settlement_time,
+                status=RedemptionStatus(redemption.status),
+                channel=RedemptionChannel(redemption.channel),
+                requires_approval=redemption.requires_approval,
+                window_id=str(redemption.window_id) if redemption.window_id else None,
+                actual_fee=str(redemption.actual_fee) if redemption.actual_fee else None,
+                net_amount=str(redemption.net_amount) if redemption.net_amount else None,
+                settlement_tx_hash=redemption.settlement_tx_hash,
+                settled_at=redemption.settled_at,
+                approval_ticket_id=redemption.approval_ticket_id,
+                approved_by=redemption.approved_by,
+                approved_at=redemption.approved_at,
+                rejected_by=redemption.rejected_by,
+                rejected_at=redemption.rejected_at,
+                rejection_reason=redemption.rejection_reason,
+                created_at=redemption.created_at,
+                updated_at=redemption.updated_at,
+                timeline=timeline,
+            )
 
     async def approve_redemption(
         self,
@@ -334,163 +338,185 @@ class RedemptionService:
     ) -> bool:
         """Approve or reject a redemption request.
 
-        Args:
-            redemption_id: Redemption ID
-            request: Approval request data
-            approver: Approver wallet address
-
-        Returns:
-            True if successful
-
-        Raises:
-            ValueError: If redemption not found or invalid state
+        @param redemption_id - Redemption database ID
+        @param request - Approval request data
+        @param approver - Approver wallet address
+        @returns True if successful
+        @raises ValueError if redemption not found or invalid state
         """
-        redemption = self._redemptions.get(redemption_id)
-        if not redemption:
-            raise ValueError(f"Redemption {redemption_id} not found")
+        async with self._session_factory() as session:
+            repo = RedemptionRepository(session)
+            audit_repo = AuditLogRepository(session)
 
-        if redemption.status != RedemptionStatus.PENDING_APPROVAL:
-            raise ValueError(
-                f"Redemption {redemption_id} is not pending approval "
-                f"(current status: {redemption.status})"
-            )
+            redemption = await repo.get_by_id(redemption_id)
+            if not redemption:
+                raise ValueError(f"Redemption {redemption_id} not found")
 
-        now = datetime.now(timezone.utc)
+            if redemption.status != RedemptionStatus.PENDING_APPROVAL.value:
+                raise ValueError(
+                    f"Redemption {redemption_id} is not pending approval "
+                    f"(current status: {redemption.status})"
+                )
 
-        if request.action == RedemptionAction.APPROVE:
-            redemption.status = RedemptionStatus.APPROVED
-            redemption.approved_by = approver
-            redemption.approved_at = now
-            redemption.timeline_events.append(
-                {
-                    "event_type": "APPROVED",
-                    "timestamp": now,
-                    "actor": approver,
-                    "tx_hash": None,
-                    "details": {"reason": request.reason} if request.reason else None,
-                }
-            )
-            logger.info(f"Redemption {redemption_id} approved by {approver}")
+            now = datetime.now(timezone.utc)
 
-        else:  # REJECT
-            redemption.status = RedemptionStatus.REJECTED
-            redemption.rejected_by = approver
-            redemption.rejected_at = now
-            redemption.rejection_reason = request.reason
-            redemption.timeline_events.append(
-                {
-                    "event_type": "REJECTED",
-                    "timestamp": now,
-                    "actor": approver,
-                    "tx_hash": None,
-                    "details": {"reason": request.reason} if request.reason else None,
-                }
-            )
-            logger.info(
-                f"Redemption {redemption_id} rejected by {approver}: {request.reason}"
-            )
+            if request.action == RedemptionAction.APPROVE:
+                await repo.update_status(
+                    redemption_id,
+                    RedemptionStatus.APPROVED.value,
+                    approved_by=approver.lower(),
+                )
 
-        redemption.updated_at = now
-        return True
+                await audit_repo.create({
+                    "action": "redemption.approved",
+                    "resource_type": "redemption",
+                    "resource_id": str(redemption_id),
+                    "actor_address": approver.lower(),
+                    "new_value": {
+                        "reason": request.reason,
+                        "gross_amount": str(redemption.gross_amount),
+                    },
+                })
+
+                logger.info(f"Redemption {redemption_id} approved by {approver}")
+
+            else:  # REJECT
+                await repo.update_status(
+                    redemption_id,
+                    RedemptionStatus.REJECTED.value,
+                    rejected_by=approver.lower(),
+                    rejection_reason=request.reason,
+                )
+
+                await audit_repo.create({
+                    "action": "redemption.rejected",
+                    "resource_type": "redemption",
+                    "resource_id": str(redemption_id),
+                    "actor_address": approver.lower(),
+                    "new_value": {
+                        "reason": request.reason,
+                        "gross_amount": str(redemption.gross_amount),
+                    },
+                })
+
+                logger.info(
+                    f"Redemption {redemption_id} rejected by {approver}: {request.reason}"
+                )
+
+            await session.commit()
+            return True
 
     async def trigger_settlement(
         self,
         redemption_id: int,
         force: bool = False,
+        operator: str | None = None,
     ) -> SettlementResponse:
         """Trigger manual settlement for a redemption.
 
-        Args:
-            redemption_id: Redemption ID
-            force: Force settlement even if conditions not met
+        In production, this would call the smart contract.
+        Currently creates an audit trail and updates status.
 
-        Returns:
-            Settlement response
+        @param redemption_id - Redemption database ID
+        @param force - Force settlement even if conditions not met
+        @param operator - Operator wallet address triggering settlement
+        @returns Settlement response with status and tx hash
         """
-        redemption = self._redemptions.get(redemption_id)
-        if not redemption:
-            return SettlementResponse(
-                success=False,
-                tx_hash=None,
-                message=f"Redemption {redemption_id} not found",
+        async with self._session_factory() as session:
+            repo = RedemptionRepository(session)
+            audit_repo = AuditLogRepository(session)
+
+            redemption = await repo.get_by_id(redemption_id)
+            if not redemption:
+                return SettlementResponse(
+                    success=False,
+                    tx_hash=None,
+                    message=f"Redemption {redemption_id} not found",
+                )
+
+            # Check if settlement is allowed
+            allowed_statuses = [
+                RedemptionStatus.PENDING.value,
+                RedemptionStatus.APPROVED.value,
+            ]
+            if redemption.status not in allowed_statuses:
+                return SettlementResponse(
+                    success=False,
+                    tx_hash=None,
+                    message=f"Cannot settle redemption with status {redemption.status}",
+                )
+
+            # Check if settlement time has passed
+            now = datetime.now(timezone.utc)
+            if not force and now < redemption.settlement_time:
+                return SettlementResponse(
+                    success=False,
+                    tx_hash=None,
+                    message=f"Settlement time not reached. Expected: {redemption.settlement_time}",
+                )
+
+            # TODO: In production, call smart contract here
+            # For now, simulate settlement transaction
+            settlement_tx = f"0x{'a' * 62}{redemption_id:02d}"
+
+            # Calculate net amount
+            actual_fee = redemption.estimated_fee
+            net_amount = redemption.gross_amount - actual_fee
+
+            # Update redemption record
+            await repo.settle(
+                redemption_id,
+                actual_fee=actual_fee,
+                net_amount=net_amount,
+                settlement_tx_hash=settlement_tx,
             )
 
-        # Check if settlement is allowed
-        allowed_statuses = [RedemptionStatus.PENDING, RedemptionStatus.APPROVED]
-        if redemption.status not in allowed_statuses:
-            return SettlementResponse(
-                success=False,
-                tx_hash=None,
-                message=f"Cannot settle redemption with status {redemption.status.value}",
-            )
-
-        # Check if settlement time has passed
-        now = datetime.now(timezone.utc)
-        if not force and now < redemption.settlement_time:
-            return SettlementResponse(
-                success=False,
-                tx_hash=None,
-                message=f"Settlement time not reached. Expected: {redemption.settlement_time}",
-            )
-
-        # In a real implementation, this would call the smart contract
-        # For now, simulate settlement
-        settlement_tx = f"0x{'a' * 62}01"
-        redemption.status = RedemptionStatus.SETTLED
-        redemption.settled_at = now
-        redemption.settlement_tx_hash = settlement_tx
-        redemption.actual_fee = redemption.estimated_fee
-        redemption.net_amount = redemption.gross_amount - redemption.estimated_fee
-        redemption.updated_at = now
-
-        redemption.timeline_events.append(
-            {
-                "event_type": "SETTLED",
-                "timestamp": now,
-                "actor": None,
-                "tx_hash": settlement_tx,
-                "details": {
-                    "actual_fee": str(redemption.actual_fee),
-                    "net_amount": str(redemption.net_amount),
+            # Audit log
+            await audit_repo.create({
+                "action": "redemption.settled",
+                "resource_type": "redemption",
+                "resource_id": str(redemption_id),
+                "actor_address": operator.lower() if operator else None,
+                "new_value": {
+                    "tx_hash": settlement_tx,
+                    "actual_fee": str(actual_fee),
+                    "net_amount": str(net_amount),
                     "forced": force,
                 },
-            }
-        )
+            })
 
-        logger.info(f"Redemption {redemption_id} settled: {settlement_tx}")
+            await session.commit()
+            logger.info(f"Redemption {redemption_id} settled: {settlement_tx}")
 
-        return SettlementResponse(
-            success=True,
-            tx_hash=settlement_tx,
-            message="Settlement triggered successfully",
-        )
+            return SettlementResponse(
+                success=True,
+                tx_hash=settlement_tx,
+                message="Settlement triggered successfully",
+            )
 
     async def get_stats(self) -> RedemptionStats:
         """Get redemption statistics.
 
-        Returns:
-            Redemption statistics
+        @returns Aggregated redemption statistics
         """
-        stats = RedemptionStats()
+        async with self._session_factory() as session:
+            repo = RedemptionRepository(session)
+            stats_data = await repo.get_statistics()
 
-        for redemption in self._redemptions.values():
-            stats.total_requests += 1
-            stats.total_volume += redemption.gross_amount
+            stats = RedemptionStats()
+            status_counts = stats_data.get("by_status", {})
 
-            if redemption.status == RedemptionStatus.PENDING:
-                stats.pending_requests += 1
-            elif redemption.status == RedemptionStatus.PENDING_APPROVAL:
-                stats.pending_approval += 1
-            elif redemption.status == RedemptionStatus.APPROVED:
-                stats.approved_requests += 1
-            elif redemption.status == RedemptionStatus.SETTLED:
-                stats.settled_requests += 1
-            elif redemption.status == RedemptionStatus.REJECTED:
-                stats.rejected_requests += 1
-            elif redemption.status == RedemptionStatus.CANCELLED:
-                stats.cancelled_requests += 1
+            stats.total_requests = stats_data.get("total_count", 0)
+            stats.total_volume = stats_data.get("total_amount", Decimal(0))
 
-        return stats
+            stats.pending_requests = status_counts.get("PENDING", 0)
+            stats.pending_approval = status_counts.get("PENDING_APPROVAL", 0)
+            stats.approved_requests = status_counts.get("APPROVED", 0)
+            stats.settled_requests = status_counts.get("SETTLED", 0)
+            stats.rejected_requests = status_counts.get("REJECTED", 0)
+            stats.cancelled_requests = status_counts.get("CANCELLED", 0)
+
+            return stats
 
     async def get_pending_approvals(
         self,
@@ -499,12 +525,9 @@ class RedemptionService:
     ) -> RedemptionListResponse:
         """Get redemptions pending approval.
 
-        Args:
-            page: Page number
-            page_size: Items per page
-
-        Returns:
-            Paginated list of pending approvals
+        @param page - Page number
+        @param page_size - Items per page
+        @returns Paginated list of pending approvals
         """
         filters = RedemptionFilterParams(status=RedemptionStatus.PENDING_APPROVAL)
         return await self.list_redemptions(
@@ -515,28 +538,100 @@ class RedemptionService:
             sort_order=SortOrder.ASC,
         )
 
-    def get_redemption_by_request_id(self, request_id: Decimal) -> int | None:
-        """Get redemption ID by on-chain request ID.
+    async def get_redemption_by_request_id(
+        self, request_id: Decimal
+    ) -> RedemptionDetail | None:
+        """Get redemption by on-chain request ID.
 
-        Args:
-            request_id: On-chain request ID
-
-        Returns:
-            Database ID or None if not found
+        @param request_id - On-chain request ID
+        @returns Redemption detail or None if not found
         """
-        for redemption in self._redemptions.values():
-            if redemption.request_id == request_id:
-                return redemption.id
-        return None
+        async with self._session_factory() as session:
+            repo = RedemptionRepository(session)
+            redemption = await repo.get_by_request_id(request_id)
+
+            if not redemption:
+                return None
+
+            return await self.get_redemption_detail(redemption.id)
+
+    async def link_approval_ticket(
+        self,
+        redemption_id: int,
+        ticket_id: str,
+    ) -> bool:
+        """Link an approval ticket to a redemption.
+
+        @param redemption_id - Redemption database ID
+        @param ticket_id - Approval ticket ID
+        @returns True if successful
+        """
+        async with self._session_factory() as session:
+            repo = RedemptionRepository(session)
+
+            updated = await repo.update(
+                redemption_id,
+                {"approval_ticket_id": ticket_id}
+            )
+
+            if updated:
+                await session.commit()
+                logger.info(
+                    f"Linked approval ticket {ticket_id} to redemption {redemption_id}"
+                )
+                return True
+            return False
+
+    async def get_ready_for_settlement(self) -> list[RedemptionDetail]:
+        """Get all redemptions ready for settlement.
+
+        @returns List of redemptions ready to be settled
+        """
+        async with self._session_factory() as session:
+            repo = RedemptionRepository(session)
+            records = await repo.get_ready_for_settlement()
+
+            results = []
+            for r in records:
+                detail = await self.get_redemption_detail(r.id)
+                if detail:
+                    results.append(detail)
+
+            return results
+
+    @staticmethod
+    def requires_approval(
+        gross_amount: Decimal,
+        channel: RedemptionChannel,
+    ) -> bool:
+        """Determine if a redemption amount requires approval.
+
+        @param gross_amount - Gross redemption amount in USDC
+        @param channel - Redemption channel type
+        @returns True if approval is required
+        """
+        if channel == RedemptionChannel.EMERGENCY:
+            return gross_amount > RedemptionService.EMERGENCY_APPROVAL_THRESHOLD
+        else:
+            return gross_amount > RedemptionService.STANDARD_APPROVAL_THRESHOLD
 
 
-# Service singleton
+# Service singleton with dependency injection support
 _redemption_service: RedemptionService | None = None
 
 
 def get_redemption_service() -> RedemptionService:
-    """Get or create redemption service singleton."""
+    """Get or create redemption service singleton.
+
+    @returns RedemptionService instance
+    """
     global _redemption_service
     if _redemption_service is None:
         _redemption_service = RedemptionService()
     return _redemption_service
+
+
+def reset_redemption_service() -> None:
+    """Reset redemption service singleton (for testing)."""
+    global _redemption_service
+    _redemption_service = None

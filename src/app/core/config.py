@@ -85,6 +85,43 @@ class Settings(BaseSettings):
         default="json", description="Log output format"
     )
 
+    # Notifications - Slack
+    slack_webhook_url: str | None = Field(
+        default=None, description="Slack incoming webhook URL"
+    )
+    slack_channel: str | None = Field(
+        default=None, description="Slack channel override (optional)"
+    )
+    slack_mention_on_critical: bool = Field(
+        default=True, description="Mention @channel on critical alerts"
+    )
+
+    # Notifications - Telegram
+    telegram_bot_token: str | None = Field(
+        default=None, description="Telegram bot token"
+    )
+    telegram_chat_id: str | None = Field(
+        default=None, description="Telegram chat/group ID"
+    )
+
+    # Notifications - Email (SMTP)
+    smtp_host: str | None = Field(default=None, description="SMTP server host")
+    smtp_port: int = Field(default=587, description="SMTP server port")
+    smtp_user: str | None = Field(default=None, description="SMTP username")
+    smtp_password: str | None = Field(default=None, description="SMTP password")
+    smtp_from_email: str | None = Field(
+        default=None, description="Email sender address"
+    )
+    smtp_from_name: str = Field(
+        default="Paimon Alert System", description="Email sender name"
+    )
+    smtp_use_tls: bool = Field(default=True, description="Use TLS for SMTP")
+
+    # Notifications - Recipients
+    alert_email_recipients: list[str] = Field(
+        default=[], description="Email addresses for alerts"
+    )
+
     @computed_field
     @property
     def database_url(self) -> str:

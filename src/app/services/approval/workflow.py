@@ -1,12 +1,25 @@
-"""Approval workflow engine."""
+"""Approval workflow engine with database persistence.
+
+Features:
+- Multi-level approval support
+- Configurable rules based on amount/type
+- SLA tracking with warnings and deadlines
+- Auto-escalation on SLA breach
+- Complete audit trail in database
+"""
 
 import logging
 import uuid
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.infrastructure.database.session import AsyncSessionLocal
+from app.models.approval import ApprovalTicket, ApprovalRecord as ApprovalRecordModel
+from app.repositories.approval import ApprovalRepository, ApprovalRecordRepository
+from app.repositories.audit_log import AuditLogRepository
 from app.services.approval.schemas import (
     ApprovalAction,
     ApprovalActionRequest,
@@ -21,7 +34,6 @@ from app.services.approval.schemas import (
     ApprovalTicketListResponse,
     ApprovalTicketStatus,
     ApprovalTicketType,
-    AuditLogEntry,
     EscalationConfig,
     PaginationMeta,
     SLAConfig,
@@ -30,38 +42,8 @@ from app.services.approval.schemas import (
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class InMemoryTicket:
-    """In-memory approval ticket."""
-
-    id: str
-    ticket_type: ApprovalTicketType
-    reference_type: str
-    reference_id: str
-    requester: str
-    amount: Decimal | None
-    description: str | None
-    request_data: dict[str, Any] | None
-    risk_assessment: dict[str, Any] | None
-    status: ApprovalTicketStatus
-    required_approvals: int
-    current_approvals: int
-    current_rejections: int
-    sla_warning: datetime
-    sla_deadline: datetime
-    escalated_at: datetime | None
-    escalated_to: list[str] | None
-    result: ApprovalResult | None
-    result_reason: str | None
-    resolved_at: datetime | None
-    resolved_by: str | None
-    approval_records: list[dict[str, Any]]
-    created_at: datetime
-    updated_at: datetime
-
-
 class ApprovalWorkflowEngine:
-    """Engine for managing approval workflows.
+    """Engine for managing approval workflows with database persistence.
 
     Features:
     - Multi-level approval support
@@ -69,45 +51,35 @@ class ApprovalWorkflowEngine:
     - SLA tracking with warnings and deadlines
     - Auto-escalation on SLA breach
     - Complete audit trail
+
+    Uses Repository pattern for database operations.
     """
 
-    # Default approval rules
+    # Default approval rules - aligned with product specs
+    # Emergency: >30K USDC needs approval
+    # Standard: >100K USDC needs approval
     DEFAULT_RULES: list[ApprovalRuleConfig] = [
-        # Small redemptions - single operator approval
+        # Standard redemptions (30K-100K) - single operator approval
         ApprovalRuleConfig(
             ticket_type=ApprovalTicketType.REDEMPTION,
-            max_amount=Decimal("10000000000000000000000"),  # 10000 tokens
+            min_amount=Decimal("30000000000"),  # 30K USDC (6 decimals)
+            max_amount=Decimal("100000000000"),  # 100K USDC
             required_approvals=1,
             required_level=ApprovalLevel.OPERATOR,
             sla=SLAConfig(warning_hours=4, deadline_hours=24),
         ),
-        # Large redemptions - manager approval
+        # Large redemptions (>100K) - manager approval
         ApprovalRuleConfig(
             ticket_type=ApprovalTicketType.REDEMPTION,
-            min_amount=Decimal("10000000000000000000000"),
-            max_amount=Decimal("100000000000000000000000"),  # 100000 tokens
+            min_amount=Decimal("100000000000"),  # 100K USDC
             required_approvals=2,
             required_level=ApprovalLevel.MANAGER,
             sla=SLAConfig(warning_hours=2, deadline_hours=12),
         ),
-        # Very large redemptions - admin approval
-        ApprovalRuleConfig(
-            ticket_type=ApprovalTicketType.REDEMPTION,
-            min_amount=Decimal("100000000000000000000000"),
-            required_approvals=3,
-            required_level=ApprovalLevel.ADMIN,
-            sla=SLAConfig(warning_hours=1, deadline_hours=8),
-        ),
-        # Rebalancing - manager approval
-        ApprovalRuleConfig(
-            ticket_type=ApprovalTicketType.REBALANCING,
-            required_approvals=2,
-            required_level=ApprovalLevel.MANAGER,
-            sla=SLAConfig(warning_hours=2, deadline_hours=12),
-        ),
-        # Emergency - immediate admin approval
+        # Emergency redemptions (>30K) - urgent admin approval
         ApprovalRuleConfig(
             ticket_type=ApprovalTicketType.EMERGENCY,
+            min_amount=Decimal("30000000000"),  # 30K USDC
             required_approvals=1,
             required_level=ApprovalLevel.EMERGENCY,
             sla=SLAConfig(warning_hours=0.5, deadline_hours=2),
@@ -116,6 +88,13 @@ class ApprovalWorkflowEngine:
                 escalate_after_hours=0.5,
                 escalate_to_level=ApprovalLevel.EMERGENCY,
             ),
+        ),
+        # Rebalancing - manager approval
+        ApprovalRuleConfig(
+            ticket_type=ApprovalTicketType.REBALANCING,
+            required_approvals=2,
+            required_level=ApprovalLevel.MANAGER,
+            sla=SLAConfig(warning_hours=2, deadline_hours=12),
         ),
         # Asset changes - admin approval
         ApprovalRuleConfig(
@@ -150,26 +129,23 @@ class ApprovalWorkflowEngine:
     def __init__(
         self,
         rules: list[ApprovalRuleConfig] | None = None,
-        repository: Any = None,
+        session_factory: Callable[[], AsyncSession] | None = None,
     ):
         """Initialize approval workflow engine.
 
-        Args:
-            rules: Custom approval rules (uses defaults if None)
-            repository: Optional database repository
+        @param rules - Custom approval rules (uses defaults if None)
+        @param session_factory - Optional factory for creating database sessions
         """
         self.rules = rules or self.DEFAULT_RULES
-        self.repository = repository
-        self._tickets: dict[str, InMemoryTicket] = {}
-        self._audit_log: list[AuditLogEntry] = []
+        self._session_factory = session_factory or AsyncSessionLocal
+        # Cache for approver levels (can be loaded from database or RBAC service)
         self._approver_levels: dict[str, ApprovalLevel] = {}
 
     def set_approver_level(self, address: str, level: ApprovalLevel) -> None:
         """Set approval level for an address.
 
-        Args:
-            address: Approver wallet address
-            level: Approval level
+        @param address - Approver wallet address
+        @param level - Approval level
         """
         self._approver_levels[address.lower()] = level
         logger.info(f"Set approval level {level} for {address}")
@@ -177,11 +153,8 @@ class ApprovalWorkflowEngine:
     def get_approver_level(self, address: str) -> ApprovalLevel | None:
         """Get approval level for an address.
 
-        Args:
-            address: Approver wallet address
-
-        Returns:
-            Approval level or None if not set
+        @param address - Approver wallet address
+        @returns Approval level or None if not set
         """
         return self._approver_levels.get(address.lower())
 
@@ -192,12 +165,9 @@ class ApprovalWorkflowEngine:
     ) -> ApprovalRuleConfig:
         """Find matching rule for ticket type and amount.
 
-        Args:
-            ticket_type: Type of ticket
-            amount: Amount if applicable
-
-        Returns:
-            Matching rule configuration
+        @param ticket_type - Type of ticket
+        @param amount - Amount if applicable
+        @returns Matching rule configuration
         """
         matching_rules = []
         for rule in self.rules:
@@ -233,115 +203,117 @@ class ApprovalWorkflowEngine:
     ) -> bool:
         """Check if approver has sufficient level.
 
-        Args:
-            approver_level: Approver's level
-            required_level: Required level
-
-        Returns:
-            True if approver can approve
+        @param approver_level - Approver's level
+        @param required_level - Required level
+        @returns True if approver can approve
         """
         return (
             self.LEVEL_HIERARCHY.get(approver_level, 0)
             >= self.LEVEL_HIERARCHY.get(required_level, 0)
         )
 
-    def _log_audit(
+    async def _log_audit(
         self,
+        session: AsyncSession,
         ticket_id: str,
         action: str,
         actor: str,
-        old_status: ApprovalTicketStatus | None = None,
-        new_status: ApprovalTicketStatus | None = None,
+        old_status: str | None = None,
+        new_status: str | None = None,
         details: dict[str, Any] | None = None,
     ) -> None:
-        """Log an audit entry.
+        """Log an audit entry to database.
 
-        Args:
-            ticket_id: Ticket ID
-            action: Action type
-            actor: Actor address
-            old_status: Previous status
-            new_status: New status
-            details: Additional details
+        @param session - Database session
+        @param ticket_id - Ticket ID
+        @param action - Action type
+        @param actor - Actor address
+        @param old_status - Previous status
+        @param new_status - New status
+        @param details - Additional details
         """
-        entry = AuditLogEntry(
-            id=str(uuid.uuid4()),
-            ticket_id=ticket_id,
-            action=action,
-            actor=actor,
-            timestamp=datetime.now(timezone.utc),
-            old_status=old_status,
-            new_status=new_status,
-            details=details,
-        )
-        self._audit_log.append(entry)
+        audit_repo = AuditLogRepository(session)
+        await audit_repo.create({
+            "action": f"approval.{action.lower()}",
+            "resource_type": "approval_ticket",
+            "resource_id": ticket_id,
+            "actor_address": actor.lower() if actor and actor != "SYSTEM" else None,
+            "old_value": {"status": old_status} if old_status else None,
+            "new_value": {
+                "status": new_status,
+                **(details or {}),
+            },
+        })
 
     async def create_ticket(
         self,
         data: ApprovalTicketCreate,
     ) -> str:
-        """Create a new approval ticket.
+        """Create a new approval ticket in database.
 
-        Args:
-            data: Ticket creation data
-
-        Returns:
-            Created ticket ID
+        @param data - Ticket creation data
+        @returns Created ticket ID
         """
-        # Find applicable rule
-        rule = self._find_rule(data.ticket_type, data.amount)
+        async with self._session_factory() as session:
+            repo = ApprovalRepository(session)
 
-        ticket_id = f"APR-{uuid.uuid4().hex[:8].upper()}"
-        now = datetime.now(timezone.utc)
+            # Check for existing ticket for same reference
+            existing = await repo.get_by_reference(
+                data.reference_type, data.reference_id
+            )
+            if existing:
+                logger.warning(
+                    f"Ticket already exists for {data.reference_type}:{data.reference_id}"
+                )
+                return existing.id
 
-        ticket = InMemoryTicket(
-            id=ticket_id,
-            ticket_type=data.ticket_type,
-            reference_type=data.reference_type,
-            reference_id=data.reference_id,
-            requester=data.requester,
-            amount=data.amount,
-            description=data.description,
-            request_data=data.request_data,
-            risk_assessment=data.risk_assessment,
-            status=ApprovalTicketStatus.PENDING,
-            required_approvals=rule.required_approvals,
-            current_approvals=0,
-            current_rejections=0,
-            sla_warning=rule.sla.get_warning_time(now),
-            sla_deadline=rule.sla.get_deadline_time(now),
-            escalated_at=None,
-            escalated_to=None,
-            result=None,
-            result_reason=None,
-            resolved_at=None,
-            resolved_by=None,
-            approval_records=[],
-            created_at=now,
-            updated_at=now,
-        )
+            # Find applicable rule
+            rule = self._find_rule(data.ticket_type, data.amount)
 
-        self._tickets[ticket_id] = ticket
+            ticket_id = f"APR-{uuid.uuid4().hex[:8].upper()}"
+            now = datetime.now(timezone.utc)
 
-        self._log_audit(
-            ticket_id=ticket_id,
-            action="CREATED",
-            actor=data.requester,
-            new_status=ApprovalTicketStatus.PENDING,
-            details={
+            # Create ticket record
+            await repo.create({
+                "id": ticket_id,
                 "ticket_type": data.ticket_type.value,
-                "amount": str(data.amount) if data.amount else None,
+                "reference_type": data.reference_type,
+                "reference_id": data.reference_id,
+                "requester": data.requester.lower(),
+                "amount": data.amount,
+                "description": data.description,
+                "request_data": data.request_data,
+                "risk_assessment": data.risk_assessment,
+                "status": ApprovalTicketStatus.PENDING.value,
                 "required_approvals": rule.required_approvals,
-                "required_level": rule.required_level.value,
-            },
-        )
+                "current_approvals": 0,
+                "current_rejections": 0,
+                "sla_warning": rule.sla.get_warning_time(now),
+                "sla_deadline": rule.sla.get_deadline_time(now),
+            })
 
-        logger.info(
-            f"Created ticket {ticket_id} type={data.ticket_type} "
-            f"required_approvals={rule.required_approvals}"
-        )
+            # Audit log
+            await self._log_audit(
+                session,
+                ticket_id=ticket_id,
+                action="CREATED",
+                actor=data.requester,
+                new_status=ApprovalTicketStatus.PENDING.value,
+                details={
+                    "ticket_type": data.ticket_type.value,
+                    "amount": str(data.amount) if data.amount else None,
+                    "required_approvals": rule.required_approvals,
+                    "required_level": rule.required_level.value,
+                },
+            )
 
-        return ticket_id
+            await session.commit()
+            logger.info(
+                f"Created ticket {ticket_id} type={data.ticket_type} "
+                f"required_approvals={rule.required_approvals}"
+            )
+
+            return ticket_id
 
     async def process_action(
         self,
@@ -351,279 +323,294 @@ class ApprovalWorkflowEngine:
     ) -> bool:
         """Process an approval or rejection action.
 
-        Args:
-            ticket_id: Ticket ID
-            request: Action request
-            approver: Approver address
-
-        Returns:
-            True if action was successful
-
-        Raises:
-            ValueError: If ticket not found, invalid state, or insufficient level
+        @param ticket_id - Ticket ID
+        @param request - Action request
+        @param approver - Approver address
+        @returns True if action was successful
+        @raises ValueError if ticket not found, invalid state, or insufficient level
         """
-        ticket = self._tickets.get(ticket_id)
-        if not ticket:
-            raise ValueError(f"Ticket {ticket_id} not found")
+        async with self._session_factory() as session:
+            repo = ApprovalRepository(session)
+            record_repo = ApprovalRecordRepository(session)
 
-        # Check ticket is pending
-        if ticket.status not in [
-            ApprovalTicketStatus.PENDING,
-            ApprovalTicketStatus.PARTIALLY_APPROVED,
-        ]:
-            raise ValueError(
-                f"Ticket {ticket_id} is not pending (status: {ticket.status})"
-            )
+            ticket = await repo.get_with_records(ticket_id)
+            if not ticket:
+                raise ValueError(f"Ticket {ticket_id} not found")
 
-        # Check approver hasn't already acted
-        for record in ticket.approval_records:
-            if record["approver"].lower() == approver.lower():
-                raise ValueError(f"Approver {approver} has already acted on this ticket")
-
-        # Get approver level
-        approver_level = self.get_approver_level(approver)
-        if not approver_level:
-            raise ValueError(f"Approver {approver} is not registered")
-
-        # Find rule and check level
-        rule = self._find_rule(ticket.ticket_type, ticket.amount)
-        if not self._can_approve(approver_level, rule.required_level):
-            raise ValueError(
-                f"Approver level {approver_level} insufficient "
-                f"(required: {rule.required_level})"
-            )
-
-        now = datetime.now(timezone.utc)
-        old_status = ticket.status
-
-        # Record the action
-        record = {
-            "id": str(uuid.uuid4()),
-            "approver": approver,
-            "action": request.action.value,
-            "reason": request.reason,
-            "signature": request.signature,
-            "timestamp": now.isoformat(),
-            "level": approver_level.value,
-        }
-        ticket.approval_records.append(record)
-        ticket.updated_at = now
-
-        if request.action == ApprovalAction.APPROVE:
-            ticket.current_approvals += 1
-
-            if ticket.current_approvals >= ticket.required_approvals:
-                # Ticket approved
-                ticket.status = ApprovalTicketStatus.APPROVED
-                ticket.result = ApprovalResult.APPROVED
-                ticket.resolved_at = now
-                ticket.resolved_by = approver
-                logger.info(f"Ticket {ticket_id} approved")
-            else:
-                # Partially approved
-                ticket.status = ApprovalTicketStatus.PARTIALLY_APPROVED
-                logger.info(
-                    f"Ticket {ticket_id} partially approved "
-                    f"({ticket.current_approvals}/{ticket.required_approvals})"
+            # Check ticket is pending
+            if ticket.status not in [
+                ApprovalTicketStatus.PENDING.value,
+                ApprovalTicketStatus.PARTIALLY_APPROVED.value,
+            ]:
+                raise ValueError(
+                    f"Ticket {ticket_id} is not pending (status: {ticket.status})"
                 )
 
-        else:  # REJECT
-            ticket.current_rejections += 1
-            ticket.status = ApprovalTicketStatus.REJECTED
-            ticket.result = ApprovalResult.REJECTED
-            ticket.result_reason = request.reason
-            ticket.resolved_at = now
-            ticket.resolved_by = approver
-            logger.info(f"Ticket {ticket_id} rejected: {request.reason}")
+            # Check approver hasn't already acted
+            already_acted = await record_repo.has_already_acted(ticket_id, approver)
+            if already_acted:
+                raise ValueError(f"Approver {approver} has already acted on this ticket")
 
-        self._log_audit(
-            ticket_id=ticket_id,
-            action=f"ACTION_{request.action.value}",
-            actor=approver,
-            old_status=old_status,
-            new_status=ticket.status,
-            details={
+            # Get approver level
+            approver_level = self.get_approver_level(approver)
+            if not approver_level:
+                raise ValueError(f"Approver {approver} is not registered")
+
+            # Find rule and check level
+            ticket_type = ApprovalTicketType(ticket.ticket_type)
+            rule = self._find_rule(ticket_type, ticket.amount)
+            if not self._can_approve(approver_level, rule.required_level):
+                raise ValueError(
+                    f"Approver level {approver_level} insufficient "
+                    f"(required: {rule.required_level})"
+                )
+
+            now = datetime.now(timezone.utc)
+            old_status = ticket.status
+            record_id = str(uuid.uuid4())
+
+            # Create approval record
+            await record_repo.create({
+                "id": record_id,
+                "ticket_id": ticket_id,
+                "approver": approver.lower(),
+                "action": request.action.value,
                 "reason": request.reason,
-                "approver_level": approver_level.value,
-                "current_approvals": ticket.current_approvals,
-                "current_rejections": ticket.current_rejections,
-            },
-        )
+                "signature": request.signature,
+            })
 
-        return True
+            # Update ticket based on action
+            if request.action == ApprovalAction.APPROVE:
+                new_approvals = ticket.current_approvals + 1
+                update_data: dict[str, Any] = {"current_approvals": new_approvals}
+
+                if new_approvals >= ticket.required_approvals:
+                    # Ticket approved
+                    update_data["status"] = ApprovalTicketStatus.APPROVED.value
+                    update_data["result"] = ApprovalResult.APPROVED.value
+                    update_data["resolved_at"] = now
+                    update_data["resolved_by"] = approver.lower()
+                    logger.info(f"Ticket {ticket_id} approved")
+                else:
+                    # Partially approved
+                    update_data["status"] = ApprovalTicketStatus.PARTIALLY_APPROVED.value
+                    logger.info(
+                        f"Ticket {ticket_id} partially approved "
+                        f"({new_approvals}/{ticket.required_approvals})"
+                    )
+
+                await repo.update(ticket_id, update_data)
+
+            else:  # REJECT
+                await repo.update(ticket_id, {
+                    "current_rejections": ticket.current_rejections + 1,
+                    "status": ApprovalTicketStatus.REJECTED.value,
+                    "result": ApprovalResult.REJECTED.value,
+                    "result_reason": request.reason,
+                    "resolved_at": now,
+                    "resolved_by": approver.lower(),
+                })
+                logger.info(f"Ticket {ticket_id} rejected: {request.reason}")
+
+            # Audit log
+            await self._log_audit(
+                session,
+                ticket_id=ticket_id,
+                action=f"ACTION_{request.action.value}",
+                actor=approver,
+                old_status=old_status,
+                new_status=update_data.get("status") if request.action == ApprovalAction.APPROVE else ApprovalTicketStatus.REJECTED.value,
+                details={
+                    "reason": request.reason,
+                    "approver_level": approver_level.value,
+                    "record_id": record_id,
+                },
+            )
+
+            await session.commit()
+            return True
 
     async def cancel_ticket(self, ticket_id: str, actor: str, reason: str) -> bool:
         """Cancel an approval ticket.
 
-        Args:
-            ticket_id: Ticket ID
-            actor: Actor cancelling
-            reason: Cancellation reason
-
-        Returns:
-            True if cancelled
-
-        Raises:
-            ValueError: If ticket not found or already resolved
+        @param ticket_id - Ticket ID
+        @param actor - Actor cancelling
+        @param reason - Cancellation reason
+        @returns True if cancelled
+        @raises ValueError if ticket not found or already resolved
         """
-        ticket = self._tickets.get(ticket_id)
-        if not ticket:
-            raise ValueError(f"Ticket {ticket_id} not found")
+        async with self._session_factory() as session:
+            repo = ApprovalRepository(session)
 
-        if ticket.status in [
-            ApprovalTicketStatus.APPROVED,
-            ApprovalTicketStatus.REJECTED,
-            ApprovalTicketStatus.EXPIRED,
-            ApprovalTicketStatus.CANCELLED,
-        ]:
-            raise ValueError(f"Ticket {ticket_id} is already resolved")
+            ticket = await repo.get_by_id(ticket_id)
+            if not ticket:
+                raise ValueError(f"Ticket {ticket_id} not found")
 
-        old_status = ticket.status
-        now = datetime.now(timezone.utc)
+            resolved_statuses = [
+                ApprovalTicketStatus.APPROVED.value,
+                ApprovalTicketStatus.REJECTED.value,
+                ApprovalTicketStatus.EXPIRED.value,
+                ApprovalTicketStatus.CANCELLED.value,
+            ]
+            if ticket.status in resolved_statuses:
+                raise ValueError(f"Ticket {ticket_id} is already resolved")
 
-        ticket.status = ApprovalTicketStatus.CANCELLED
-        ticket.result = ApprovalResult.CANCELLED
-        ticket.result_reason = reason
-        ticket.resolved_at = now
-        ticket.resolved_by = actor
-        ticket.updated_at = now
+            old_status = ticket.status
+            now = datetime.now(timezone.utc)
 
-        self._log_audit(
-            ticket_id=ticket_id,
-            action="CANCELLED",
-            actor=actor,
-            old_status=old_status,
-            new_status=ApprovalTicketStatus.CANCELLED,
-            details={"reason": reason},
-        )
+            await repo.resolve(
+                ticket_id,
+                result=ApprovalResult.CANCELLED.value,
+                result_reason=reason,
+                resolved_by=actor.lower(),
+            )
 
-        logger.info(f"Ticket {ticket_id} cancelled: {reason}")
-        return True
+            # Audit log
+            await self._log_audit(
+                session,
+                ticket_id=ticket_id,
+                action="CANCELLED",
+                actor=actor,
+                old_status=old_status,
+                new_status=ApprovalTicketStatus.CANCELLED.value,
+                details={"reason": reason},
+            )
+
+            await session.commit()
+            logger.info(f"Ticket {ticket_id} cancelled: {reason}")
+            return True
 
     async def check_expired_tickets(self) -> list[str]:
         """Check and expire tickets past SLA deadline.
 
-        Returns:
-            List of expired ticket IDs
+        @returns List of expired ticket IDs
         """
-        expired = []
-        now = datetime.now(timezone.utc)
+        async with self._session_factory() as session:
+            repo = ApprovalRepository(session)
 
-        for ticket_id, ticket in self._tickets.items():
-            if ticket.status in [
-                ApprovalTicketStatus.PENDING,
-                ApprovalTicketStatus.PARTIALLY_APPROVED,
-            ]:
-                if now > ticket.sla_deadline:
-                    old_status = ticket.status
-                    ticket.status = ApprovalTicketStatus.EXPIRED
-                    ticket.result = ApprovalResult.EXPIRED
-                    ticket.result_reason = "SLA deadline exceeded"
-                    ticket.resolved_at = now
-                    ticket.updated_at = now
+            expired_tickets = await repo.get_expired()
+            expired_ids = []
 
-                    self._log_audit(
-                        ticket_id=ticket_id,
-                        action="EXPIRED",
-                        actor="SYSTEM",
-                        old_status=old_status,
-                        new_status=ApprovalTicketStatus.EXPIRED,
-                    )
+            for ticket in expired_tickets:
+                old_status = ticket.status
 
-                    expired.append(ticket_id)
-                    logger.warning(f"Ticket {ticket_id} expired")
+                await repo.resolve(
+                    ticket.id,
+                    result=ApprovalResult.EXPIRED.value,
+                    result_reason="SLA deadline exceeded",
+                )
 
-        return expired
+                # Audit log
+                await self._log_audit(
+                    session,
+                    ticket_id=ticket.id,
+                    action="EXPIRED",
+                    actor="SYSTEM",
+                    old_status=old_status,
+                    new_status=ApprovalTicketStatus.EXPIRED.value,
+                )
+
+                expired_ids.append(ticket.id)
+                logger.warning(f"Ticket {ticket.id} expired")
+
+            await session.commit()
+            return expired_ids
 
     async def check_escalation(self) -> list[str]:
         """Check and escalate tickets past SLA warning.
 
-        Returns:
-            List of escalated ticket IDs
+        @returns List of escalated ticket IDs
         """
-        escalated = []
-        now = datetime.now(timezone.utc)
+        async with self._session_factory() as session:
+            repo = ApprovalRepository(session)
 
-        for ticket_id, ticket in self._tickets.items():
-            if ticket.status in [
-                ApprovalTicketStatus.PENDING,
-                ApprovalTicketStatus.PARTIALLY_APPROVED,
-            ]:
-                if ticket.escalated_at is None and now > ticket.sla_warning:
-                    rule = self._find_rule(ticket.ticket_type, ticket.amount)
-                    if rule.escalation.enabled:
-                        ticket.escalated_at = now
-                        ticket.escalated_to = rule.escalation.notify_addresses
-                        ticket.updated_at = now
+            need_escalation = await repo.get_past_warning()
+            escalated_ids = []
 
-                        self._log_audit(
-                            ticket_id=ticket_id,
-                            action="ESCALATED",
-                            actor="SYSTEM",
-                            details={
-                                "escalate_to": rule.escalation.notify_addresses,
-                                "escalate_level": rule.escalation.escalate_to_level.value,
-                            },
-                        )
+            for ticket in need_escalation:
+                ticket_type = ApprovalTicketType(ticket.ticket_type)
+                rule = self._find_rule(ticket_type, ticket.amount)
 
-                        escalated.append(ticket_id)
-                        logger.warning(
-                            f"Ticket {ticket_id} escalated to "
-                            f"{rule.escalation.escalate_to_level}"
-                        )
+                if not rule.escalation.enabled:
+                    continue
 
-        return escalated
+                await repo.escalate(ticket.id, rule.escalation.notify_addresses or [])
+
+                # Audit log
+                await self._log_audit(
+                    session,
+                    ticket_id=ticket.id,
+                    action="ESCALATED",
+                    actor="SYSTEM",
+                    details={
+                        "escalate_to": rule.escalation.notify_addresses,
+                        "escalate_level": rule.escalation.escalate_to_level.value
+                        if rule.escalation.escalate_to_level else None,
+                    },
+                )
+
+                escalated_ids.append(ticket.id)
+                logger.warning(
+                    f"Ticket {ticket.id} escalated to "
+                    f"{rule.escalation.escalate_to_level}"
+                )
+
+            await session.commit()
+            return escalated_ids
 
     async def get_ticket(self, ticket_id: str) -> ApprovalTicketDetail | None:
         """Get detailed ticket information.
 
-        Args:
-            ticket_id: Ticket ID
-
-        Returns:
-            Ticket detail or None if not found
+        @param ticket_id - Ticket ID
+        @returns Ticket detail or None if not found
         """
-        ticket = self._tickets.get(ticket_id)
-        if not ticket:
-            return None
+        async with self._session_factory() as session:
+            repo = ApprovalRepository(session)
+            ticket = await repo.get_with_records(ticket_id)
 
-        return ApprovalTicketDetail(
-            id=ticket.id,
-            ticket_type=ticket.ticket_type,
-            reference_type=ticket.reference_type,
-            reference_id=ticket.reference_id,
-            requester=ticket.requester,
-            amount=str(ticket.amount) if ticket.amount else None,
-            description=ticket.description,
-            request_data=ticket.request_data,
-            risk_assessment=ticket.risk_assessment,
-            status=ticket.status,
-            required_approvals=ticket.required_approvals,
-            current_approvals=ticket.current_approvals,
-            current_rejections=ticket.current_rejections,
-            sla_warning=ticket.sla_warning,
-            sla_deadline=ticket.sla_deadline,
-            escalated_at=ticket.escalated_at,
-            escalated_to=ticket.escalated_to,
-            result=ticket.result,
-            result_reason=ticket.result_reason,
-            resolved_at=ticket.resolved_at,
-            resolved_by=ticket.resolved_by,
-            approval_records=[
+            if not ticket:
+                return None
+
+            # Convert records to schema
+            records = [
                 ApprovalRecord(
-                    id=r["id"],
-                    approver=r["approver"],
-                    action=ApprovalAction(r["action"]),
-                    reason=r.get("reason"),
-                    signature=r.get("signature"),
-                    timestamp=datetime.fromisoformat(r["timestamp"]),
-                    level=ApprovalLevel(r["level"]),
+                    id=r.id,
+                    approver=r.approver,
+                    action=ApprovalAction(r.action),
+                    reason=r.reason,
+                    signature=r.signature,
+                    timestamp=r.created_at,
+                    level=self.get_approver_level(r.approver),
                 )
-                for r in ticket.approval_records
-            ],
-            created_at=ticket.created_at,
-            updated_at=ticket.updated_at,
-        )
+                for r in ticket.records
+            ]
+
+            return ApprovalTicketDetail(
+                id=ticket.id,
+                ticket_type=ApprovalTicketType(ticket.ticket_type),
+                reference_type=ticket.reference_type,
+                reference_id=ticket.reference_id,
+                requester=ticket.requester,
+                amount=str(ticket.amount) if ticket.amount else None,
+                description=ticket.description,
+                request_data=ticket.request_data,
+                risk_assessment=ticket.risk_assessment,
+                status=ApprovalTicketStatus(ticket.status),
+                required_approvals=ticket.required_approvals,
+                current_approvals=ticket.current_approvals,
+                current_rejections=ticket.current_rejections,
+                sla_warning=ticket.sla_warning,
+                sla_deadline=ticket.sla_deadline,
+                escalated_at=ticket.escalated_at,
+                escalated_to=ticket.escalated_to,
+                result=ApprovalResult(ticket.result) if ticket.result else None,
+                result_reason=ticket.result_reason,
+                resolved_at=ticket.resolved_at,
+                resolved_by=ticket.resolved_by,
+                approval_records=records,
+                created_at=ticket.created_at,
+                updated_at=ticket.updated_at,
+            )
 
     async def list_tickets(
         self,
@@ -636,72 +623,86 @@ class ApprovalWorkflowEngine:
     ) -> ApprovalTicketListResponse:
         """List approval tickets with filters.
 
-        Args:
-            status: Filter by status
-            ticket_type: Filter by type
-            requester: Filter by requester
-            escalated_only: Only show escalated tickets
-            page: Page number
-            page_size: Items per page
-
-        Returns:
-            Paginated ticket list
+        @param status - Filter by status
+        @param ticket_type - Filter by type
+        @param requester - Filter by requester
+        @param escalated_only - Only show escalated tickets
+        @param page - Page number
+        @param page_size - Items per page
+        @returns Paginated ticket list
         """
-        filtered = list(self._tickets.values())
+        async with self._session_factory() as session:
+            from sqlalchemy import select, func, and_, desc
 
-        if status:
-            filtered = [t for t in filtered if t.status == status]
+            # Build query
+            conditions = []
 
-        if ticket_type:
-            filtered = [t for t in filtered if t.ticket_type == ticket_type]
+            if status:
+                conditions.append(ApprovalTicket.status == status.value)
 
-        if requester:
-            filtered = [
-                t for t in filtered if t.requester.lower() == requester.lower()
+            if ticket_type:
+                conditions.append(ApprovalTicket.ticket_type == ticket_type.value)
+
+            if requester:
+                conditions.append(ApprovalTicket.requester == requester.lower())
+
+            if escalated_only:
+                conditions.append(ApprovalTicket.escalated_at.isnot(None))
+
+            # Base query
+            base_query = select(ApprovalTicket)
+            if conditions:
+                base_query = base_query.where(and_(*conditions))
+
+            # Count total
+            count_query = select(func.count()).select_from(base_query.subquery())
+            total_result = await session.execute(count_query)
+            total_items = total_result.scalar() or 0
+
+            # Paginate
+            offset = (page - 1) * page_size
+            base_query = (
+                base_query.order_by(desc(ApprovalTicket.created_at))
+                .offset(offset)
+                .limit(page_size)
+            )
+
+            result = await session.execute(base_query)
+            tickets = result.scalars().all()
+
+            total_pages = (
+                (total_items + page_size - 1) // page_size if total_items > 0 else 0
+            )
+
+            items = [
+                ApprovalTicketListItem(
+                    id=t.id,
+                    ticket_type=ApprovalTicketType(t.ticket_type),
+                    reference_type=t.reference_type,
+                    reference_id=t.reference_id,
+                    requester=t.requester,
+                    amount=str(t.amount) if t.amount else None,
+                    status=ApprovalTicketStatus(t.status),
+                    required_approvals=t.required_approvals,
+                    current_approvals=t.current_approvals,
+                    current_rejections=t.current_rejections,
+                    sla_warning=t.sla_warning,
+                    sla_deadline=t.sla_deadline,
+                    escalated=t.escalated_at is not None,
+                    created_at=t.created_at,
+                )
+                for t in tickets
             ]
 
-        if escalated_only:
-            filtered = [t for t in filtered if t.escalated_at is not None]
-
-        # Sort by created_at descending
-        filtered.sort(key=lambda t: t.created_at, reverse=True)
-
-        # Paginate
-        total_items = len(filtered)
-        total_pages = (total_items + page_size - 1) // page_size if total_items > 0 else 0
-        start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        page_items = filtered[start_idx:end_idx]
-
-        items = [
-            ApprovalTicketListItem(
-                id=t.id,
-                ticket_type=t.ticket_type,
-                reference_type=t.reference_type,
-                reference_id=t.reference_id,
-                requester=t.requester,
-                amount=str(t.amount) if t.amount else None,
-                status=t.status,
-                required_approvals=t.required_approvals,
-                current_approvals=t.current_approvals,
-                current_rejections=t.current_rejections,
-                sla_warning=t.sla_warning,
-                sla_deadline=t.sla_deadline,
-                escalated=t.escalated_at is not None,
-                created_at=t.created_at,
+            return ApprovalTicketListResponse(
+                items=items,
+                meta=PaginationMeta(
+                    page=page,
+                    page_size=page_size,
+                    total_items=total_items,
+                    total_pages=total_pages,
+                ),
             )
-            for t in page_items
-        ]
-
-        return ApprovalTicketListResponse(
-            items=items,
-            meta=PaginationMeta(
-                page=page,
-                page_size=page_size,
-                total_items=total_items,
-                total_pages=total_pages,
-            ),
-        )
 
     async def get_pending_for_approver(
         self,
@@ -711,13 +712,10 @@ class ApprovalWorkflowEngine:
     ) -> ApprovalTicketListResponse:
         """Get pending tickets that an approver can act on.
 
-        Args:
-            approver: Approver address
-            page: Page number
-            page_size: Items per page
-
-        Returns:
-            Paginated ticket list
+        @param approver - Approver address
+        @param page - Page number
+        @param page_size - Items per page
+        @returns Paginated ticket list
         """
         approver_level = self.get_approver_level(approver)
         if not approver_level:
@@ -728,123 +726,124 @@ class ApprovalWorkflowEngine:
                 ),
             )
 
-        filtered = []
-        for ticket in self._tickets.values():
-            if ticket.status not in [
-                ApprovalTicketStatus.PENDING,
-                ApprovalTicketStatus.PARTIALLY_APPROVED,
-            ]:
-                continue
+        async with self._session_factory() as session:
+            repo = ApprovalRepository(session)
+            record_repo = ApprovalRecordRepository(session)
 
-            # Check if approver hasn't already acted
-            already_acted = any(
-                r["approver"].lower() == approver.lower()
-                for r in ticket.approval_records
+            # Get pending tickets
+            pending_tickets = await repo.get_pending()
+
+            # Filter by level and not already acted
+            filtered = []
+            for ticket in pending_tickets:
+                already_acted = await record_repo.has_already_acted(
+                    ticket.id, approver
+                )
+                if already_acted:
+                    continue
+
+                ticket_type = ApprovalTicketType(ticket.ticket_type)
+                rule = self._find_rule(ticket_type, ticket.amount)
+                if self._can_approve(approver_level, rule.required_level):
+                    filtered.append(ticket)
+
+            # Sort by SLA deadline (most urgent first)
+            filtered.sort(key=lambda t: t.sla_deadline)
+
+            # Paginate
+            total_items = len(filtered)
+            total_pages = (
+                (total_items + page_size - 1) // page_size if total_items > 0 else 0
             )
-            if already_acted:
-                continue
+            start_idx = (page - 1) * page_size
+            end_idx = start_idx + page_size
+            page_items = filtered[start_idx:end_idx]
 
-            # Check if approver has sufficient level
-            rule = self._find_rule(ticket.ticket_type, ticket.amount)
-            if self._can_approve(approver_level, rule.required_level):
-                filtered.append(ticket)
+            items = [
+                ApprovalTicketListItem(
+                    id=t.id,
+                    ticket_type=ApprovalTicketType(t.ticket_type),
+                    reference_type=t.reference_type,
+                    reference_id=t.reference_id,
+                    requester=t.requester,
+                    amount=str(t.amount) if t.amount else None,
+                    status=ApprovalTicketStatus(t.status),
+                    required_approvals=t.required_approvals,
+                    current_approvals=t.current_approvals,
+                    current_rejections=t.current_rejections,
+                    sla_warning=t.sla_warning,
+                    sla_deadline=t.sla_deadline,
+                    escalated=t.escalated_at is not None,
+                    created_at=t.created_at,
+                )
+                for t in page_items
+            ]
 
-        # Sort by SLA deadline (most urgent first)
-        filtered.sort(key=lambda t: t.sla_deadline)
-
-        # Paginate
-        total_items = len(filtered)
-        total_pages = (total_items + page_size - 1) // page_size if total_items > 0 else 0
-        start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        page_items = filtered[start_idx:end_idx]
-
-        items = [
-            ApprovalTicketListItem(
-                id=t.id,
-                ticket_type=t.ticket_type,
-                reference_type=t.reference_type,
-                reference_id=t.reference_id,
-                requester=t.requester,
-                amount=str(t.amount) if t.amount else None,
-                status=t.status,
-                required_approvals=t.required_approvals,
-                current_approvals=t.current_approvals,
-                current_rejections=t.current_rejections,
-                sla_warning=t.sla_warning,
-                sla_deadline=t.sla_deadline,
-                escalated=t.escalated_at is not None,
-                created_at=t.created_at,
+            return ApprovalTicketListResponse(
+                items=items,
+                meta=PaginationMeta(
+                    page=page,
+                    page_size=page_size,
+                    total_items=total_items,
+                    total_pages=total_pages,
+                ),
             )
-            for t in page_items
-        ]
-
-        return ApprovalTicketListResponse(
-            items=items,
-            meta=PaginationMeta(
-                page=page,
-                page_size=page_size,
-                total_items=total_items,
-                total_pages=total_pages,
-            ),
-        )
 
     async def get_stats(self) -> ApprovalStats:
         """Get approval workflow statistics.
 
-        Returns:
-            Approval statistics
+        @returns Approval statistics
         """
-        stats = ApprovalStats()
-        resolution_times = []
+        async with self._session_factory() as session:
+            repo = ApprovalRepository(session)
+            stats_data = await repo.get_statistics()
 
-        for ticket in self._tickets.values():
-            stats.total_tickets += 1
+            status_counts = stats_data.get("by_status", {})
+            avg_resolution_seconds = stats_data.get("avg_resolution_seconds", 0)
 
-            if ticket.status == ApprovalTicketStatus.PENDING:
-                stats.pending_tickets += 1
-            elif ticket.status == ApprovalTicketStatus.PARTIALLY_APPROVED:
-                stats.partially_approved += 1
-            elif ticket.status == ApprovalTicketStatus.APPROVED:
-                stats.approved_tickets += 1
-            elif ticket.status == ApprovalTicketStatus.REJECTED:
-                stats.rejected_tickets += 1
-            elif ticket.status == ApprovalTicketStatus.EXPIRED:
-                stats.expired_tickets += 1
+            # Count escalated tickets
+            from sqlalchemy import select, func, and_
 
-            if ticket.escalated_at is not None and ticket.result is None:
-                stats.escalated_tickets += 1
+            escalated_query = (
+                select(func.count(ApprovalTicket.id))
+                .where(
+                    and_(
+                        ApprovalTicket.escalated_at.isnot(None),
+                        ApprovalTicket.result.is_(None),
+                    )
+                )
+            )
+            result = await session.execute(escalated_query)
+            escalated_count = result.scalar() or 0
 
-            if ticket.resolved_at:
-                duration = (ticket.resolved_at - ticket.created_at).total_seconds() / 3600
-                resolution_times.append(duration)
+            return ApprovalStats(
+                total_tickets=stats_data.get("total_count", 0),
+                pending_tickets=status_counts.get("PENDING", 0),
+                partially_approved=status_counts.get("PARTIALLY_APPROVED", 0),
+                approved_tickets=status_counts.get("APPROVED", 0),
+                rejected_tickets=status_counts.get("REJECTED", 0),
+                expired_tickets=status_counts.get("EXPIRED", 0),
+                escalated_tickets=escalated_count,
+                avg_resolution_hours=avg_resolution_seconds / 3600.0 if avg_resolution_seconds else 0.0,
+            )
 
-        if resolution_times:
-            stats.avg_resolution_hours = sum(resolution_times) / len(resolution_times)
+    async def get_ticket_by_reference(
+        self, reference_type: str, reference_id: str
+    ) -> ApprovalTicketDetail | None:
+        """Get ticket by reference.
 
-        return stats
-
-    def get_audit_log(
-        self,
-        ticket_id: str | None = None,
-        limit: int = 100,
-    ) -> list[AuditLogEntry]:
-        """Get audit log entries.
-
-        Args:
-            ticket_id: Filter by ticket ID
-            limit: Maximum entries to return
-
-        Returns:
-            List of audit log entries
+        @param reference_type - Type of reference
+        @param reference_id - ID of referenced entity
+        @returns Ticket detail or None if not found
         """
-        entries = self._audit_log
+        async with self._session_factory() as session:
+            repo = ApprovalRepository(session)
+            ticket = await repo.get_by_reference(reference_type, reference_id)
 
-        if ticket_id:
-            entries = [e for e in entries if e.ticket_id == ticket_id]
+            if not ticket:
+                return None
 
-        # Return most recent first
-        return sorted(entries, key=lambda e: e.timestamp, reverse=True)[:limit]
+            return await self.get_ticket(ticket.id)
 
 
 # Singleton instance
@@ -852,8 +851,17 @@ _workflow_engine: ApprovalWorkflowEngine | None = None
 
 
 def get_approval_workflow_engine() -> ApprovalWorkflowEngine:
-    """Get or create approval workflow engine singleton."""
+    """Get or create approval workflow engine singleton.
+
+    @returns ApprovalWorkflowEngine instance
+    """
     global _workflow_engine
     if _workflow_engine is None:
         _workflow_engine = ApprovalWorkflowEngine()
     return _workflow_engine
+
+
+def reset_approval_workflow_engine() -> None:
+    """Reset approval workflow engine singleton (for testing)."""
+    global _workflow_engine
+    _workflow_engine = None

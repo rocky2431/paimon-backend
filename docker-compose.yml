@@ -1,5 +1,7 @@
-# Docker Compose for local development
+# Docker Compose for Paimon Backend
 # Usage: docker-compose up -d
+# Full stack: docker-compose --profile full up -d
+# With monitoring: docker-compose --profile monitoring up -d
 
 version: '3.8'
 
@@ -9,25 +11,28 @@ services:
     image: timescale/timescaledb:latest-pg16
     container_name: paimon-postgres
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: paimon
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_NAME:-paimon}
     ports:
-      - "5432:5432"
+      - "${DB_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - paimon-network
 
-  # Redis
+  # Redis for Celery broker and caching
   redis:
     image: redis:7-alpine
     container_name: paimon-redis
+    command: redis-server --appendonly yes
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -35,8 +40,154 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - paimon-network
 
-  # Redis Commander (optional - for debugging)
+  # FastAPI Application Server
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paimon-api
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - DEBUG=${DEBUG:-false}
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - DB_NAME=${DB_NAME:-paimon}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_FORMAT=${LOG_FORMAT:-json}
+      # Blockchain
+      - BSC_RPC_URL=${BSC_RPC_URL:-https://bsc-dataseed.binance.org/}
+      - VAULT_CONTRACT_ADDRESS=${VAULT_CONTRACT_ADDRESS:-}
+      - REDEMPTION_MANAGER_ADDRESS=${REDEMPTION_MANAGER_ADDRESS:-}
+      # Notifications
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - SMTP_FROM_EMAIL=${SMTP_FROM_EMAIL:-}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./src:/app/src:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - paimon-network
+    profiles:
+      - full
+
+  # Celery Worker - processes async tasks
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paimon-celery-worker
+    command: celery -A app.core.celery_app worker --queues=critical,high,normal,low --concurrency=4 --loglevel=${LOG_LEVEL:-INFO} --hostname=worker@%h
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - DB_NAME=${DB_NAME:-paimon}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Notifications
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - SMTP_FROM_EMAIL=${SMTP_FROM_EMAIL:-}
+    volumes:
+      - ./src:/app/src:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - paimon-network
+    profiles:
+      - full
+
+  # Celery Beat - scheduled tasks
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paimon-celery-beat
+    command: celery -A app.core.celery_app beat --loglevel=${LOG_LEVEL:-INFO} --scheduler=celery.beat:PersistentScheduler
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - DB_NAME=${DB_NAME:-paimon}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./src:/app/src:ro
+      - celery_schedule:/app/schedule
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - paimon-network
+    profiles:
+      - full
+
+  # Celery Flower - task monitoring dashboard
+  celery-flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paimon-celery-flower
+    command: celery -A app.core.celery_app flower --port=5555 --broker_api=redis://redis:6379/0
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+    ports:
+      - "${FLOWER_PORT:-5555}:5555"
+    depends_on:
+      - redis
+      - celery-worker
+    networks:
+      - paimon-network
+    profiles:
+      - monitoring
+
+  # Redis Commander - Redis GUI for debugging
   redis-commander:
     image: rediscommander/redis-commander:latest
     container_name: paimon-redis-commander
@@ -46,13 +197,32 @@ services:
       - "8081:8081"
     depends_on:
       - redis
+    networks:
+      - paimon-network
+    profiles:
+      - debug
+
+  # pgAdmin - PostgreSQL GUI for debugging
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: paimon-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@paimon.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - paimon-network
     profiles:
       - debug
 
 volumes:
   postgres_data:
   redis_data:
+  celery_schedule:
 
 networks:
-  default:
-    name: paimon-network
+  paimon-network:
+    driver: bridge

@@ -1,4 +1,13 @@
-"""Rebalancing execution engine."""
+"""Rebalancing execution engine with database persistence.
+
+Features:
+- eth_call simulation before execution
+- Tiered wallet selection (hot/warm/cold)
+- Transaction building and submission
+- State updates and monitoring
+- Retry on failure with backoff
+- Complete audit trail in database
+"""
 
 import asyncio
 import logging
@@ -7,6 +16,11 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.infrastructure.database.session import AsyncSessionLocal
+from app.repositories.rebalance import RebalanceRepository
+from app.repositories.audit_log import AuditLogRepository
 from app.services.rebalance.executor_schemas import (
     ExecutionConfig,
     ExecutionContext,
@@ -31,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 
 class RebalanceExecutor:
-    """Executor for rebalance plan transactions.
+    """Executor for rebalance plan transactions with database persistence.
 
     Features:
     - eth_call simulation before execution
@@ -39,6 +53,8 @@ class RebalanceExecutor:
     - Transaction building and submission
     - State updates and monitoring
     - Retry on failure with backoff
+    - Database persistence for execution history
+    - Complete audit trail
     """
 
     # Default wallet configurations
@@ -68,16 +84,16 @@ class RebalanceExecutor:
         config: ExecutionConfig | None = None,
         wallets: dict[WalletTier, WalletConfig] | None = None,
         simulator: Callable[[TransactionRequest], SimulationResult] | None = None,
-        submitter: Callable[[TransactionRequest, WalletTier], str | None]
-        | None = None,
+        submitter: Callable[[TransactionRequest, WalletTier], str | None] | None = None,
+        session_factory: Callable[[], AsyncSession] | None = None,
     ):
         """Initialize rebalance executor.
 
-        Args:
-            config: Execution configuration
-            wallets: Wallet configurations by tier
-            simulator: Custom simulation function (for testing)
-            submitter: Custom transaction submitter (for testing)
+        @param config - Execution configuration
+        @param wallets - Wallet configurations by tier
+        @param simulator - Custom simulation function (for testing)
+        @param submitter - Custom transaction submitter (for testing)
+        @param session_factory - Optional factory for creating database sessions
         """
         self.config = config or ExecutionConfig()
         # Create a deep copy of wallets to avoid shared state issues
@@ -96,7 +112,7 @@ class RebalanceExecutor:
             }
         self._simulator = simulator
         self._submitter = submitter
-        self._executions: dict[str, ExecutionContext] = {}
+        self._session_factory = session_factory or AsyncSessionLocal
         self._daily_usage: dict[WalletTier, Decimal] = {
             tier: Decimal(0) for tier in WalletTier
         }
@@ -107,11 +123,8 @@ class RebalanceExecutor:
         Selection priority: HOT -> WARM -> COLD
         Considers: single tx limit, daily limit, active status
 
-        Args:
-            amount: Transaction amount
-
-        Returns:
-            Selected wallet config or None if no suitable wallet
+        @param amount - Transaction amount
+        @returns Selected wallet config or None if no suitable wallet
         """
         for tier in [WalletTier.HOT, WalletTier.WARM, WalletTier.COLD]:
             wallet = self.wallets.get(tier)
@@ -137,16 +150,14 @@ class RebalanceExecutor:
     ) -> SimulationResult:
         """Simulate transaction using eth_call.
 
-        Args:
-            request: Transaction request to simulate
-
-        Returns:
-            Simulation result
+        @param request - Transaction request to simulate
+        @returns Simulation result
         """
         if self._simulator:
             return self._simulator(request)
 
         # Default simulation (mock for now)
+        # In production, would call actual eth_call
         return SimulationResult(
             success=True,
             gas_estimate=200000,
@@ -161,18 +172,15 @@ class RebalanceExecutor:
     ) -> str | None:
         """Submit transaction to the blockchain.
 
-        Args:
-            request: Transaction request
-            wallet_tier: Wallet tier to use for signing
-
-        Returns:
-            Transaction hash or None if failed
+        @param request - Transaction request
+        @param wallet_tier - Wallet tier to use for signing
+        @returns Transaction hash or None if failed
         """
         if self._submitter:
             return self._submitter(request, wallet_tier)
 
         # Default submission (mock for now)
-        # Generate 64 hex chars for transaction hash
+        # In production, would call actual contract
         return "0x" + uuid.uuid4().hex + uuid.uuid4().hex
 
     async def wait_for_confirmation(
@@ -182,14 +190,12 @@ class RebalanceExecutor:
     ) -> tuple[bool, int | None, str | None]:
         """Wait for transaction confirmation.
 
-        Args:
-            tx_hash: Transaction hash
-            confirmations: Required confirmations
-
-        Returns:
-            Tuple of (success, block_number, error_message)
+        @param tx_hash - Transaction hash
+        @param confirmations - Required confirmations
+        @returns Tuple of (success, block_number, error_message)
         """
         # Mock confirmation (would use actual chain polling)
+        # In production, would poll the blockchain for confirmations
         await asyncio.sleep(0.01)  # Simulate network latency
         return True, 12345678, None
 
@@ -200,12 +206,9 @@ class RebalanceExecutor:
     ) -> TransactionRequest:
         """Build transaction request from plan step.
 
-        Args:
-            step: Rebalance plan step
-            wallet: Wallet to use
-
-        Returns:
-            Transaction request
+        @param step - Rebalance plan step
+        @param wallet - Wallet to use
+        @returns Transaction request
         """
         # Build call data based on action type
         data = self._encode_action_data(step)
@@ -213,7 +216,7 @@ class RebalanceExecutor:
         return TransactionRequest(
             step_id=step.step_id,
             from_address=wallet.address,
-            to_address="0x" + "a" * 40,  # Contract address (would be from config)
+            to_address="0x" + "a" * 40,  # Contract address (from config in production)
             value=Decimal(0),
             data=data,
             gas_limit=300000,
@@ -222,13 +225,10 @@ class RebalanceExecutor:
     def _encode_action_data(self, step: RebalancePlanStep) -> str:
         """Encode action data for transaction.
 
-        Args:
-            step: Rebalance plan step
-
-        Returns:
-            Hex-encoded call data
+        @param step - Rebalance plan step
+        @returns Hex-encoded call data
         """
-        # Mock encoding (would use actual contract ABI)
+        # Mock encoding (would use actual contract ABI in production)
         if step.action == RebalanceAction.SWAP:
             return "0x" + "swap" + "0" * 56
         elif step.action == RebalanceAction.LIQUIDATE:
@@ -246,12 +246,9 @@ class RebalanceExecutor:
     ) -> TransactionRecord:
         """Execute a single step with retry logic.
 
-        Args:
-            step: Step to execute
-            context: Execution context
-
-        Returns:
-            Transaction record
+        @param step - Step to execute
+        @param context - Execution context
+        @returns Transaction record
         """
         policy = self.config.retry_policy
         retry_count = 0
@@ -261,9 +258,7 @@ class RebalanceExecutor:
             # Select wallet
             wallet = self.select_wallet(step.amount)
             if not wallet:
-                raise ValueError(
-                    f"No suitable wallet for amount {step.amount}"
-                )
+                raise ValueError(f"No suitable wallet for amount {step.amount}")
 
             # Build transaction
             tx_request = self._build_transaction_request(step, wallet)
@@ -290,13 +285,10 @@ class RebalanceExecutor:
                     if not sim_result.success:
                         tx_record.status = TransactionStatus.SIMULATION_FAILED
                         tx_record.error_message = sim_result.error_message
-                        raise ValueError(
-                            f"Simulation failed: {sim_result.error_message}"
-                        )
+                        raise ValueError(f"Simulation failed: {sim_result.error_message}")
 
                     tx_request.gas_limit = int(
-                        sim_result.gas_estimate
-                        * float(self.config.gas_price_multiplier)
+                        sim_result.gas_estimate * float(self.config.gas_price_multiplier)
                     )
 
                 # Build and sign
@@ -368,14 +360,13 @@ class RebalanceExecutor:
     async def execute_plan(
         self,
         plan: RebalancePlan,
+        executed_by: str | None = None,
     ) -> ExecutionResult:
-        """Execute a rebalance plan.
+        """Execute a rebalance plan with database persistence.
 
-        Args:
-            plan: Rebalance plan to execute
-
-        Returns:
-            Execution result
+        @param plan - Rebalance plan to execute
+        @param executed_by - Address of executor
+        @returns Execution result
         """
         if plan.status != RebalanceStatus.APPROVED:
             raise ValueError(
@@ -393,12 +384,33 @@ class RebalanceExecutor:
             total_steps=len(plan.steps),
             started_at=now,
         )
-        self._executions[execution_id] = context
 
         logger.info(
             f"Starting execution {execution_id} for plan {plan.plan_id} "
             f"with {len(plan.steps)} steps"
         )
+
+        # Update database - start execution
+        async with self._session_factory() as session:
+            repo = RebalanceRepository(session)
+            audit_repo = AuditLogRepository(session)
+
+            # Start execution in database
+            await repo.start_execution(plan.plan_id, executed_by=executed_by or "system")
+
+            # Audit log
+            await audit_repo.create({
+                "action": "rebalance.execution_started",
+                "resource_type": "rebalance",
+                "resource_id": plan.plan_id,
+                "actor_address": executed_by.lower() if executed_by else None,
+                "new_value": {
+                    "execution_id": execution_id,
+                    "total_steps": len(plan.steps),
+                },
+            })
+
+            await session.commit()
 
         completed_steps = 0
         total_gas = 0
@@ -419,9 +431,7 @@ class RebalanceExecutor:
                     total_gas += tx_record.gas_used or 0
                     total_value += step.amount
 
-                    logger.info(
-                        f"Step {step.step_id} completed: {tx_record.tx_hash}"
-                    )
+                    logger.info(f"Step {step.step_id} completed: {tx_record.tx_hash}")
 
                 except Exception as e:
                     logger.error(f"Step {step.step_id} failed: {e}")
@@ -467,6 +477,74 @@ class RebalanceExecutor:
             error_message=context.error_message,
         )
 
+        # Update database - complete/fail execution
+        async with self._session_factory() as session:
+            repo = RebalanceRepository(session)
+            audit_repo = AuditLogRepository(session)
+
+            # Build execution results for database
+            execution_results = {
+                "execution_id": execution_id,
+                "completed_steps": completed_steps,
+                "total_steps": len(plan.steps),
+                "transactions": [
+                    {
+                        "tx_id": tx.tx_id,
+                        "tx_hash": tx.tx_hash,
+                        "status": tx.status.value,
+                        "gas_used": tx.gas_used,
+                    }
+                    for tx in context.transactions
+                ],
+                "error": context.error_message,
+            }
+
+            if context.status == ExecutionStatus.COMPLETED:
+                # Build post-state (simplified - would calculate actual state)
+                post_state = {
+                    "completed_at": context.completed_at.isoformat() if context.completed_at else None,
+                    "total_value_moved": str(total_value),
+                }
+
+                await repo.complete(
+                    plan.plan_id,
+                    post_state=post_state,
+                    execution_results=execution_results,
+                    actual_gas_cost=Decimal(total_gas),
+                )
+            elif context.status == ExecutionStatus.FAILED:
+                await repo.fail(
+                    plan.plan_id,
+                    error_message=context.error_message or "Execution failed",
+                    execution_results=execution_results,
+                )
+            else:
+                # Partially completed
+                await repo.update(
+                    plan.plan_id,
+                    {
+                        "status": "FAILED",  # Partial completion is still a failure
+                        "execution_results": execution_results,
+                    },
+                )
+
+            # Audit log
+            await audit_repo.create({
+                "action": f"rebalance.execution_{context.status.value.lower()}",
+                "resource_type": "rebalance",
+                "resource_id": plan.plan_id,
+                "actor_address": executed_by.lower() if executed_by else None,
+                "new_value": {
+                    "execution_id": execution_id,
+                    "completed_steps": completed_steps,
+                    "total_steps": len(plan.steps),
+                    "total_gas_used": total_gas,
+                    "status": context.status.value,
+                },
+            })
+
+            await session.commit()
+
         logger.info(
             f"Execution {execution_id} finished: {context.status.value}, "
             f"{completed_steps}/{len(plan.steps)} steps completed"
@@ -474,55 +552,62 @@ class RebalanceExecutor:
 
         return result
 
-    def get_execution(self, execution_id: str) -> ExecutionContext | None:
-        """Get execution context by ID.
+    async def get_execution(self, plan_id: str) -> dict[str, Any] | None:
+        """Get execution details from database.
 
-        Args:
-            execution_id: Execution ID
-
-        Returns:
-            Execution context or None
+        @param plan_id - Plan ID
+        @returns Execution details or None
         """
-        return self._executions.get(execution_id)
+        async with self._session_factory() as session:
+            repo = RebalanceRepository(session)
+            record = await repo.get_by_id(plan_id)
 
-    def get_execution_status(self, execution_id: str) -> ExecutionStatus | None:
-        """Get execution status by ID.
+            if not record:
+                return None
 
-        Args:
-            execution_id: Execution ID
+            return {
+                "id": record.id,
+                "status": record.status,
+                "trigger_type": record.trigger_type,
+                "executed_at": record.executed_at,
+                "executed_by": record.executed_by,
+                "execution_results": record.execution_results,
+                "actual_gas_cost": str(record.actual_gas_cost) if record.actual_gas_cost else None,
+            }
 
-        Returns:
-            Execution status or None
+    async def cancel_execution(self, plan_id: str, actor: str, reason: str) -> bool:
+        """Cancel a pending or executing rebalance.
+
+        @param plan_id - Plan ID
+        @param actor - Actor cancelling
+        @param reason - Cancellation reason
+        @returns True if cancelled
         """
-        context = self._executions.get(execution_id)
-        return context.status if context else None
+        async with self._session_factory() as session:
+            repo = RebalanceRepository(session)
+            audit_repo = AuditLogRepository(session)
 
-    async def cancel_execution(self, execution_id: str) -> bool:
-        """Cancel an ongoing execution.
+            record = await repo.get_by_id(plan_id)
+            if not record:
+                raise ValueError(f"Rebalance {plan_id} not found")
 
-        Args:
-            execution_id: Execution ID
+            if record.status in ["COMPLETED", "FAILED", "CANCELLED"]:
+                raise ValueError(f"Cannot cancel rebalance in {record.status} status")
 
-        Returns:
-            True if cancelled
-        """
-        context = self._executions.get(execution_id)
-        if not context:
-            raise ValueError(f"Execution {execution_id} not found")
+            await repo.cancel(plan_id, reason=reason)
 
-        if context.status in [
-            ExecutionStatus.COMPLETED,
-            ExecutionStatus.FAILED,
-            ExecutionStatus.CANCELLED,
-        ]:
-            raise ValueError(
-                f"Cannot cancel execution in {context.status.value} status"
-            )
+            # Audit log
+            await audit_repo.create({
+                "action": "rebalance.cancelled",
+                "resource_type": "rebalance",
+                "resource_id": plan_id,
+                "actor_address": actor.lower(),
+                "new_value": {"reason": reason},
+            })
 
-        context.status = ExecutionStatus.CANCELLED
-        context.completed_at = datetime.now(timezone.utc)
-        logger.info(f"Cancelled execution {execution_id}")
-        return True
+            await session.commit()
+            logger.info(f"Cancelled rebalance {plan_id}: {reason}")
+            return True
 
     def reset_daily_usage(self) -> None:
         """Reset daily usage counters for all wallets."""
@@ -533,17 +618,15 @@ class RebalanceExecutor:
     def get_daily_usage(self) -> dict[WalletTier, Decimal]:
         """Get current daily usage for all wallets.
 
-        Returns:
-            Daily usage by wallet tier
+        @returns Daily usage by wallet tier
         """
         return self._daily_usage.copy()
 
     def set_wallet_active(self, tier: WalletTier, active: bool) -> None:
         """Set wallet active status.
 
-        Args:
-            tier: Wallet tier
-            active: Whether wallet is active
+        @param tier - Wallet tier
+        @param active - Whether wallet is active
         """
         if tier in self.wallets:
             self.wallets[tier].is_active = active
@@ -555,8 +638,17 @@ _executor: RebalanceExecutor | None = None
 
 
 def get_rebalance_executor() -> RebalanceExecutor:
-    """Get or create rebalance executor singleton."""
+    """Get or create rebalance executor singleton.
+
+    @returns RebalanceExecutor instance
+    """
     global _executor
     if _executor is None:
         _executor = RebalanceExecutor()
     return _executor
+
+
+def reset_rebalance_executor() -> None:
+    """Reset rebalance executor singleton (for testing)."""
+    global _executor
+    _executor = None
