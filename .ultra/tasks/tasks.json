@@ -70,12 +70,13 @@
       "complexity": 6,
       "priority": "P0",
       "dependencies": ["4"],
-      "status": "pending",
+      "status": "completed",
       "type": "architecture",
       "phase": "A",
       "trace_to": "docs/backend/06-database-design.md",
       "isNewTask": true,
-      "blockingReason": "All services currently use InMemory storage. Cannot proceed without database tables."
+      "completedAt": "2024-12-15T10:30:00Z",
+      "evidence": "migrations/versions/20241215_1000_002_create_business_tables.py - Creates 8 tables: redemption_requests, approval_tickets, approval_records, asset_configs, rebalance_history, transactions, risk_events, audit_logs with all indexes and constraints"
     },
     {
       "id": "NEW-A2",
@@ -511,14 +512,14 @@
   ],
   "metadata": {
     "totalTasks": 35,
-    "completedTasks": 4,
+    "completedTasks": 5,
     "prototypeTasks": 22,
-    "pendingNewTasks": 9,
+    "pendingNewTasks": 8,
     "actualProductionReady": "~15%",
     "byStatus": {
-      "completed": 4,
+      "completed": 5,
       "prototype": 22,
-      "pending": 9
+      "pending": 8
     },
     "criticalNewTasks": ["NEW-A1", "NEW-A2", "NEW-A3", "NEW-B1", "NEW-B2", "NEW-B3", "NEW-B4"],
     "criticalPath": ["NEW-A1", "NEW-A2", "NEW-B1", "NEW-B2", "NEW-B3", "30", "31"],
