@@ -1,5 +1,11 @@
 """Approval workflow service module."""
 
+from app.services.approval.executor import (
+    ApprovalExecutionResult,
+    ApprovalExecutor,
+    ExecutionStatus,
+    get_approval_executor,
+)
 from app.services.approval.schemas import (
     ApprovalAction,
     ApprovalLevel,
@@ -26,6 +32,7 @@ __all__ = [
     "ApprovalResult",
     "ApprovalAction",
     "ApprovalLevel",
+    "ExecutionStatus",
     # Config schemas
     "ApprovalRuleConfig",
     "SLAConfig",
@@ -38,4 +45,8 @@ __all__ = [
     # Engine
     "ApprovalWorkflowEngine",
     "get_approval_workflow_engine",
+    # Executor (v2.0.0 - On-chain execution)
+    "ApprovalExecutor",
+    "ApprovalExecutionResult",
+    "get_approval_executor",
 ]

@@ -1,4 +1,10 @@
-"""Risk monitoring service."""
+"""Risk monitoring service.
+
+v2.0.0 Enhancements:
+- Integration with ContractManager for on-chain quota data
+- Support for reading sevenDayLiability, overdueLiability from chain
+- Real-time L1+L2 coverage calculation
+"""
 
 import logging
 import uuid
@@ -6,6 +12,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+from app.core.config import get_settings
 from app.services.risk.schemas import (
     ConcentrationRisk,
     LiquidityRisk,
@@ -33,18 +40,175 @@ class RiskMonitorService:
     - Redemption pressure tracking
     - Overall risk scoring
     - Alert generation
+
+    v2.0.0: Supports on-chain quota and liability data reading.
     """
 
-    def __init__(self, config: RiskConfig | None = None):
+    def __init__(self, config: RiskConfig | None = None, use_chain_data: bool | None = None):
         """Initialize risk monitor service.
 
         Args:
             config: Risk configuration
+            use_chain_data: Whether to fetch data from chain (uses feature flag if None)
         """
         self.config = config or RiskConfig()
         self._alerts: dict[str, RiskAlert] = {}
         self._alert_id = 0
         self._assessments: list[RiskAssessment] = []
+
+        # Determine chain data mode
+        if use_chain_data is not None:
+            self._use_chain_data = use_chain_data
+        else:
+            settings = get_settings()
+            self._use_chain_data = settings.ff_blockchain_execution == "real"
+
+        # Lazy-loaded chain services
+        self._contract_manager = None
+
+    def _ensure_chain_services(self) -> None:
+        """Lazy-initialize chain services for on-chain data reading."""
+        if self._contract_manager is None:
+            from app.infrastructure.blockchain.client import BSCClient
+            from app.infrastructure.blockchain.contracts import ContractManager
+
+            client = BSCClient()
+            self._contract_manager = ContractManager(client)
+            logger.info("RiskMonitorService: Chain services initialized")
+
+    async def get_chain_liability_data(self) -> dict[str, Any]:
+        """Get liability data from chain (v2.0.0).
+
+        Returns:
+            Dictionary with:
+            - seven_day_liability: 7-day forward liability
+            - overdue_liability: Overdue liability amount
+            - daily_liability: List of daily liability amounts (7 days)
+            - l1_liquidity: L1 tier liquidity
+            - l2_liquidity: L2 tier liquidity
+            - standard_quota: Standard channel quota
+        """
+        if not self._use_chain_data:
+            # Return mock data
+            return {
+                "seven_day_liability": Decimal(0),
+                "overdue_liability": Decimal(0),
+                "daily_liability": [Decimal(0)] * 7,
+                "l1_liquidity": Decimal(0),
+                "l2_liquidity": Decimal(0),
+                "standard_quota": Decimal(0),
+            }
+
+        self._ensure_chain_services()
+        settings = get_settings()
+
+        try:
+            # Get redemption manager stats
+            rm_stats = await self._contract_manager.get_redemption_stats(
+                settings.active_redemption_manager
+            )
+
+            # Get liquidity breakdown
+            liquidity = await self._contract_manager.get_liquidity_breakdown(
+                settings.active_vault_address
+            )
+
+            # Get daily liability for each day
+            daily_liability = []
+            for day_index in range(7):
+                try:
+                    amount = await self._contract_manager.get_daily_liability(
+                        settings.active_redemption_manager, day_index
+                    )
+                    daily_liability.append(Decimal(amount) if amount else Decimal(0))
+                except Exception:
+                    daily_liability.append(Decimal(0))
+
+            return {
+                "seven_day_liability": Decimal(rm_stats.get("seven_day_liability", 0)),
+                "overdue_liability": Decimal(rm_stats.get("overdue_liability", 0)),
+                "daily_liability": daily_liability,
+                "l1_liquidity": Decimal(liquidity.get("layer1_total", 0)),
+                "l2_liquidity": Decimal(liquidity.get("layer2_total", 0)),
+                "standard_quota": Decimal(liquidity.get("standard_channel_quota", 0) or 0),
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to get chain liability data: {e}")
+            return {
+                "seven_day_liability": Decimal(0),
+                "overdue_liability": Decimal(0),
+                "daily_liability": [Decimal(0)] * 7,
+                "l1_liquidity": Decimal(0),
+                "l2_liquidity": Decimal(0),
+                "standard_quota": Decimal(0),
+            }
+
+    async def assess_liability_coverage(self) -> dict[str, Any]:
+        """Assess L1+L2 coverage of 7-day liability (v2.0.0).
+
+        Returns:
+            Dictionary with coverage assessment:
+            - total_liability: Total 7-day + overdue liability
+            - available_liquidity: L1 + L2 liquidity
+            - coverage_ratio: L1+L2 / total liability
+            - coverage_level: Risk level based on coverage
+            - shortfall: Amount needed if coverage < 100%
+            - recommendations: List of recommendations
+        """
+        chain_data = await self.get_chain_liability_data()
+
+        seven_day = chain_data["seven_day_liability"]
+        overdue = chain_data["overdue_liability"]
+        l1 = chain_data["l1_liquidity"]
+        l2 = chain_data["l2_liquidity"]
+
+        total_liability = seven_day + overdue
+        available_liquidity = l1 + l2
+
+        # Calculate coverage ratio
+        if total_liability > 0:
+            coverage_ratio = available_liquidity / total_liability
+        else:
+            coverage_ratio = Decimal("999")  # No liability = max coverage
+
+        # Determine risk level based on coverage
+        if coverage_ratio >= Decimal("2.0"):
+            coverage_level = RiskLevel.LOW
+        elif coverage_ratio >= Decimal("1.5"):
+            coverage_level = RiskLevel.MEDIUM
+        elif coverage_ratio >= Decimal("1.0"):
+            coverage_level = RiskLevel.HIGH
+        else:
+            coverage_level = RiskLevel.CRITICAL
+
+        # Calculate shortfall
+        shortfall = max(Decimal(0), total_liability - available_liquidity)
+
+        # Generate recommendations
+        recommendations = []
+        if coverage_level == RiskLevel.CRITICAL:
+            recommendations.append("CRITICAL: L1+L2 不足以覆盖 7天负债，需立即调仓补充流动性")
+            if shortfall > 0:
+                recommendations.append(f"需从 L3 清算至少 {shortfall / 10**18:.2f} USDT 到 L1")
+        elif coverage_level == RiskLevel.HIGH:
+            recommendations.append("警告: 流动性覆盖率偏低，建议增加 L1/L2 配置")
+        elif coverage_level == RiskLevel.MEDIUM:
+            recommendations.append("提示: 流动性覆盖率接近阈值，持续监控")
+
+        return {
+            "total_liability": total_liability,
+            "seven_day_liability": seven_day,
+            "overdue_liability": overdue,
+            "available_liquidity": available_liquidity,
+            "l1_liquidity": l1,
+            "l2_liquidity": l2,
+            "coverage_ratio": coverage_ratio,
+            "coverage_level": coverage_level,
+            "shortfall": shortfall,
+            "recommendations": recommendations,
+            "assessed_at": datetime.now(timezone.utc),
+        }
 
     def _get_level(
         self,

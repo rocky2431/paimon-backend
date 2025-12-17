@@ -7,6 +7,7 @@ from typing import Any
 
 from web3 import AsyncHTTPProvider, AsyncWeb3
 from web3.exceptions import Web3RPCError
+from web3.middleware import ExtraDataToPOAMiddleware
 from web3.types import BlockIdentifier, TxParams, Wei
 
 from app.core.config import get_settings
@@ -57,24 +58,27 @@ class BSCClient(ChainClient):
     def __init__(
         self,
         rpc_urls: list[str] | None = None,
-        chain_id: int = 56,
+        chain_id: int | None = None,
         max_retries: int = 3,
         retry_delay: float = 1.0,
     ):
         """Initialize BSC client.
 
         Args:
-            rpc_urls: List of RPC endpoints (primary + backups)
-            chain_id: Chain ID (56 for BSC mainnet, 97 for testnet)
+            rpc_urls: List of RPC endpoints (primary + backups).
+                     If None, uses config based on blockchain_network setting.
+            chain_id: Chain ID (56 for BSC mainnet, 97 for testnet).
+                     If None, uses config based on blockchain_network setting.
             max_retries: Maximum retry attempts per RPC
             retry_delay: Delay between retries in seconds
         """
         settings = get_settings()
+        # Use active network settings if not explicitly provided
         self.rpc_urls = rpc_urls or [
-            settings.bsc_rpc_url,
-            *settings.bsc_rpc_backup_urls,
+            settings.active_rpc_url,
+            *settings.active_backup_rpc_urls,
         ]
-        self.chain_id = chain_id
+        self.chain_id = chain_id if chain_id is not None else settings.chain_id
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self._current_rpc_index = 0
@@ -88,10 +92,13 @@ class BSCClient(ChainClient):
         return self._web3
 
     def _create_web3(self, rpc_index: int | None = None) -> AsyncWeb3:
-        """Create Web3 instance for specified RPC."""
+        """Create Web3 instance for specified RPC with POA middleware."""
         index = rpc_index if rpc_index is not None else self._current_rpc_index
         rpc_url = self.rpc_urls[index]
-        return AsyncWeb3(AsyncHTTPProvider(rpc_url))
+        w3 = AsyncWeb3(AsyncHTTPProvider(rpc_url))
+        # BSC is a POA chain, need middleware to handle extraData
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        return w3
 
     async def _execute_with_failover(
         self, method: str, *args: Any, **kwargs: Any
@@ -205,7 +212,8 @@ class BSCClient(ChainClient):
 
     async def get_gas_price(self) -> Wei:
         """Get current gas price."""
-        return await self._execute_with_failover("get_gas_price")
+        # AsyncWeb3 uses gas_price property, not method
+        return await self.web3.eth.gas_price
 
     async def health_check(self) -> bool:
         """Check if client is connected and RPC is healthy."""
@@ -214,3 +222,41 @@ class BSCClient(ChainClient):
             return block_number > 0
         except Exception:
             return False
+
+    async def send_raw_transaction(self, signed_tx: bytes) -> str:
+        """Send signed raw transaction.
+
+        Args:
+            signed_tx: Signed transaction bytes
+
+        Returns:
+            Transaction hash as hex string
+        """
+        tx_hash = await self._execute_with_failover("send_raw_transaction", signed_tx)
+        return tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
+
+    async def wait_for_transaction_receipt(
+        self, tx_hash: str, timeout: int = 120, poll_latency: float = 2.0
+    ) -> dict[str, Any]:
+        """Wait for transaction receipt with timeout.
+
+        Args:
+            tx_hash: Transaction hash
+            timeout: Maximum wait time in seconds
+            poll_latency: Polling interval in seconds
+
+        Returns:
+            Transaction receipt
+
+        Raises:
+            TimeoutError: If transaction not confirmed within timeout
+        """
+        elapsed = 0.0
+        while elapsed < timeout:
+            receipt = await self.get_transaction_receipt(tx_hash)
+            if receipt and receipt.get("blockNumber") is not None:
+                return receipt
+            await asyncio.sleep(poll_latency)
+            elapsed += poll_latency
+
+        raise TimeoutError(f"Transaction {tx_hash} not confirmed within {timeout}s")

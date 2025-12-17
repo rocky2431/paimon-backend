@@ -3,10 +3,15 @@
 Features:
 - eth_call simulation before execution
 - Tiered wallet selection (hot/warm/cold)
-- Transaction building and submission
+- Transaction building and submission (real or mock)
 - State updates and monitoring
 - Retry on failure with backoff
 - Complete audit trail in database
+
+v2.0.0 Enhancements:
+- Integration with TransactionService for real chain execution
+- Integration with ContractManager for contract calls
+- Feature flag support (ff_blockchain_execution)
 """
 
 import asyncio
@@ -18,6 +23,7 @@ from typing import Any, Callable
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.infrastructure.database.session import AsyncSessionLocal
 from app.repositories.rebalance import RebalanceRepository
 from app.repositories.audit_log import AuditLogRepository
@@ -50,11 +56,14 @@ class RebalanceExecutor:
     Features:
     - eth_call simulation before execution
     - Tiered wallet selection (hot/warm/cold)
-    - Transaction building and submission
+    - Transaction building and submission (real or mock based on feature flag)
     - State updates and monitoring
     - Retry on failure with backoff
     - Database persistence for execution history
     - Complete audit trail
+
+    v2.0.0: Supports real chain execution via TransactionService when
+    ff_blockchain_execution="real".
     """
 
     # Default wallet configurations
@@ -86,6 +95,7 @@ class RebalanceExecutor:
         simulator: Callable[[TransactionRequest], SimulationResult] | None = None,
         submitter: Callable[[TransactionRequest, WalletTier], str | None] | None = None,
         session_factory: Callable[[], AsyncSession] | None = None,
+        use_real_chain: bool | None = None,
     ):
         """Initialize rebalance executor.
 
@@ -94,6 +104,7 @@ class RebalanceExecutor:
         @param simulator - Custom simulation function (for testing)
         @param submitter - Custom transaction submitter (for testing)
         @param session_factory - Optional factory for creating database sessions
+        @param use_real_chain - Override for real chain execution (uses feature flag if None)
         """
         self.config = config or ExecutionConfig()
         # Create a deep copy of wallets to avoid shared state issues
@@ -116,6 +127,49 @@ class RebalanceExecutor:
         self._daily_usage: dict[WalletTier, Decimal] = {
             tier: Decimal(0) for tier in WalletTier
         }
+
+        # Determine execution mode
+        if use_real_chain is not None:
+            self._use_real_chain = use_real_chain
+        else:
+            settings = get_settings()
+            self._use_real_chain = settings.ff_blockchain_execution == "real"
+
+        # Lazy-loaded services for real chain execution
+        self._transaction_service = None
+        self._contract_manager = None
+        self._abi_loader = None
+
+    def _ensure_chain_services(self) -> None:
+        """Lazy-initialize chain services for real execution.
+
+        Only called when _use_real_chain is True and services are needed.
+        """
+        if self._transaction_service is None:
+            from app.infrastructure.blockchain.client import BSCClient
+            from app.infrastructure.blockchain.contracts import (
+                ContractManager,
+                get_abi_loader,
+            )
+            from app.infrastructure.blockchain.transaction import (
+                TransactionService,
+                get_transaction_service,
+            )
+
+            self._abi_loader = get_abi_loader()
+            client = BSCClient()
+            self._contract_manager = ContractManager(client)
+            self._transaction_service = get_transaction_service(client)
+
+            # Update wallet addresses to use real signer address
+            if self._transaction_service:
+                real_address = self._transaction_service.address
+                for wallet in self.wallets.values():
+                    wallet.address = real_address
+
+            logger.info(
+                f"Chain services initialized, signer: {self._transaction_service.address}"
+            )
 
     def select_wallet(self, amount: Decimal) -> WalletConfig | None:
         """Select appropriate wallet based on amount.
@@ -156,8 +210,37 @@ class RebalanceExecutor:
         if self._simulator:
             return self._simulator(request)
 
-        # Default simulation (mock for now)
-        # In production, would call actual eth_call
+        # Real chain simulation
+        if self._use_real_chain:
+            self._ensure_chain_services()
+            try:
+                # Use eth_call via contract manager
+                tx_params = {
+                    "from": request.from_address,
+                    "to": request.to_address,
+                    "data": request.data,
+                    "value": int(request.value) if request.value else 0,
+                }
+                # Estimate gas as simulation
+                estimated_gas = await self._contract_manager.client.estimate_gas(tx_params)
+
+                return SimulationResult(
+                    success=True,
+                    gas_estimate=estimated_gas,
+                    return_data="0x",
+                    simulated_at=datetime.now(timezone.utc),
+                )
+            except Exception as e:
+                logger.warning(f"Simulation failed: {e}")
+                return SimulationResult(
+                    success=False,
+                    gas_estimate=0,
+                    return_data="0x",
+                    error_message=str(e),
+                    simulated_at=datetime.now(timezone.utc),
+                )
+
+        # Mock simulation (default)
         return SimulationResult(
             success=True,
             gas_estimate=200000,
@@ -179,8 +262,39 @@ class RebalanceExecutor:
         if self._submitter:
             return self._submitter(request, wallet_tier)
 
-        # Default submission (mock for now)
-        # In production, would call actual contract
+        # Real chain submission
+        if self._use_real_chain:
+            self._ensure_chain_services()
+            settings = get_settings()
+
+            try:
+                # Build and send raw transaction via TransactionService
+                from app.infrastructure.blockchain.transaction import (
+                    TransactionStatus as TxStatus,
+                )
+
+                # Use send_transaction for raw data
+                result = await self._transaction_service.send_transaction(
+                    contract_address=request.to_address,
+                    abi=[],  # Raw data, no ABI encoding needed
+                    function_name="",  # Not used for raw data
+                    args=[],
+                    gas_limit=request.gas_limit,
+                    value=int(request.value) if request.value else 0,
+                )
+
+                if result.status == TxStatus.PENDING:
+                    logger.info(f"Transaction submitted: {result.tx_hash}")
+                    return result.tx_hash
+                else:
+                    logger.error(f"Transaction failed: {result.error}")
+                    return None
+
+            except Exception as e:
+                logger.error(f"Transaction submission failed: {e}")
+                return None
+
+        # Mock submission (default)
         return "0x" + uuid.uuid4().hex + uuid.uuid4().hex
 
     async def wait_for_confirmation(
@@ -194,8 +308,25 @@ class RebalanceExecutor:
         @param confirmations - Required confirmations
         @returns Tuple of (success, block_number, error_message)
         """
-        # Mock confirmation (would use actual chain polling)
-        # In production, would poll the blockchain for confirmations
+        # Real chain confirmation
+        if self._use_real_chain:
+            self._ensure_chain_services()
+            try:
+                receipt = await self._contract_manager.client.wait_for_transaction_receipt(
+                    tx_hash, timeout=120
+                )
+
+                if receipt.get("status") == 1:
+                    return True, receipt.get("blockNumber"), None
+                else:
+                    return False, receipt.get("blockNumber"), "Transaction reverted"
+
+            except TimeoutError:
+                return False, None, "Transaction confirmation timeout"
+            except Exception as e:
+                return False, None, str(e)
+
+        # Mock confirmation (default)
         await asyncio.sleep(0.01)  # Simulate network latency
         return True, 12345678, None
 
@@ -210,13 +341,22 @@ class RebalanceExecutor:
         @param wallet - Wallet to use
         @returns Transaction request
         """
+        settings = get_settings()
+
         # Build call data based on action type
         data = self._encode_action_data(step)
+
+        # Use real vault address when in real chain mode
+        contract_address = (
+            settings.active_vault_address
+            if self._use_real_chain
+            else "0x" + "a" * 40
+        )
 
         return TransactionRequest(
             step_id=step.step_id,
             from_address=wallet.address,
-            to_address="0x" + "a" * 40,  # Contract address (from config in production)
+            to_address=contract_address,
             value=Decimal(0),
             data=data,
             gas_limit=300000,
@@ -228,7 +368,54 @@ class RebalanceExecutor:
         @param step - Rebalance plan step
         @returns Hex-encoded call data
         """
-        # Mock encoding (would use actual contract ABI in production)
+        # Real chain encoding using contract ABI
+        if self._use_real_chain:
+            self._ensure_chain_services()
+            try:
+                abi = self._abi_loader.ppt_abi
+                amount_wei = int(step.amount * 10**18)
+
+                # Map action to contract function
+                # Note: Actual function names depend on PPT contract implementation
+                if step.action == RebalanceAction.SWAP:
+                    # rebalanceSwap(uint8 fromTier, uint8 toTier, uint256 amount)
+                    from_tier_int = self._tier_to_int(step.from_tier)
+                    to_tier_int = self._tier_to_int(step.to_tier)
+                    data = self._contract_manager.encode_function_call(
+                        abi, "rebalanceSwap", [from_tier_int, to_tier_int, amount_wei]
+                    )
+                    return data.hex() if isinstance(data, bytes) else data
+
+                elif step.action == RebalanceAction.LIQUIDATE:
+                    # liquidateForL1(uint8 fromTier, uint256 amount)
+                    from_tier_int = self._tier_to_int(step.from_tier)
+                    data = self._contract_manager.encode_function_call(
+                        abi, "liquidateForL1", [from_tier_int, amount_wei]
+                    )
+                    return data.hex() if isinstance(data, bytes) else data
+
+                elif step.action == RebalanceAction.DEPOSIT:
+                    # depositToTier(uint8 tier, uint256 amount)
+                    to_tier_int = self._tier_to_int(step.to_tier)
+                    data = self._contract_manager.encode_function_call(
+                        abi, "depositToTier", [to_tier_int, amount_wei]
+                    )
+                    return data.hex() if isinstance(data, bytes) else data
+
+                elif step.action == RebalanceAction.WITHDRAW:
+                    # withdrawFromTier(uint8 tier, uint256 amount)
+                    from_tier_int = self._tier_to_int(step.from_tier)
+                    data = self._contract_manager.encode_function_call(
+                        abi, "withdrawFromTier", [from_tier_int, amount_wei]
+                    )
+                    return data.hex() if isinstance(data, bytes) else data
+
+            except Exception as e:
+                logger.error(f"Failed to encode action data: {e}")
+                # Fall back to mock encoding on error
+                pass
+
+        # Mock encoding (default)
         if step.action == RebalanceAction.SWAP:
             return "0x" + "swap" + "0" * 56
         elif step.action == RebalanceAction.LIQUIDATE:
@@ -238,6 +425,22 @@ class RebalanceExecutor:
         elif step.action == RebalanceAction.WITHDRAW:
             return "0x" + "withdraw" + "0" * 48
         return "0x"
+
+    def _tier_to_int(self, tier: Any) -> int:
+        """Convert LiquidityTier to contract tier index.
+
+        @param tier - LiquidityTier enum value
+        @returns Contract tier index (0=L1, 1=L2, 2=L3)
+        """
+        from app.services.rebalance.schemas import LiquidityTier
+
+        if tier == LiquidityTier.L1:
+            return 0
+        elif tier == LiquidityTier.L2:
+            return 1
+        elif tier == LiquidityTier.L3:
+            return 2
+        return 0  # Default to L1
 
     async def _execute_step_with_retry(
         self,

@@ -700,6 +700,351 @@ class RebalanceExecutedHandler(EventHandlerBase):
             await session.commit()
 
 
+# =============================================================================
+# v2.0.0 新增事件处理器
+# =============================================================================
+
+
+class VoucherMintedHandler(EventHandlerBase):
+    """Handler for VoucherMinted events.
+
+    NFT Voucher 在 settlementDelay > voucherThreshold 时自动铸造。
+    对应 04-approval-workflow.md 第10章。
+    """
+
+    def __init__(self):
+        super().__init__(EventType.VOUCHER_MINTED)
+
+    async def handle(self, event: ParsedEvent) -> None:
+        """Handle VoucherMinted event."""
+        args = event.args
+        request_id = Decimal(str(args.get("request_id", 0)))
+        token_id = Decimal(str(args.get("token_id", 0)))
+        owner = args.get("owner", "").lower()
+
+        logger.info(
+            "Processing VoucherMinted event",
+            extra={
+                "tx_hash": event.tx_hash,
+                "request_id": str(request_id),
+                "token_id": str(token_id),
+                "owner": owner,
+            },
+        )
+
+        async with AsyncSessionLocal() as session:
+            tx_repo = TransactionRepository(session)
+            redemption_repo = RedemptionRepository(session)
+            audit_repo = AuditLogRepository(session)
+
+            if await tx_repo.exists_tx(event.tx_hash, event.log_index):
+                return
+
+            await tx_repo.create({
+                "tx_hash": event.tx_hash,
+                "block_number": event.block_number,
+                "log_index": event.log_index,
+                "block_timestamp": event.block_timestamp,
+                "event_type": "VoucherMinted",
+                "contract_address": event.contract_address,
+                "to_address": owner,
+                "raw_data": event.raw_data,
+            })
+
+            # Update redemption request with voucher info
+            redemption = await redemption_repo.get_by_request_id(request_id)
+            if redemption:
+                await redemption_repo.update(
+                    redemption.id,
+                    {
+                        "voucher_token_id": token_id,
+                        "has_voucher": True,
+                    },
+                )
+                logger.info(
+                    "Voucher info updated for redemption",
+                    extra={
+                        "redemption_id": redemption.id,
+                        "token_id": str(token_id),
+                    },
+                )
+
+            await audit_repo.log_action(
+                action="VOUCHER_MINTED",
+                resource_type="REDEMPTION",
+                resource_id=str(request_id),
+                new_value={
+                    "token_id": str(token_id),
+                    "owner": owner,
+                },
+            )
+
+            await session.commit()
+
+
+class NavUpdatedHandler(EventHandlerBase):
+    """Handler for NavUpdated events.
+
+    NAV 更新事件用于同步链上价格数据。
+    """
+
+    def __init__(self):
+        super().__init__(EventType.NAV_UPDATED)
+
+    async def handle(self, event: ParsedEvent) -> None:
+        """Handle NavUpdated event."""
+        args = event.args
+        share_price = Decimal(str(args.get("share_price", 0)))
+        total_assets = Decimal(str(args.get("total_assets", 0)))
+        total_supply = Decimal(str(args.get("total_supply", 0)))
+
+        logger.info(
+            "Processing NavUpdated event",
+            extra={
+                "tx_hash": event.tx_hash,
+                "share_price": str(share_price),
+                "total_assets": str(total_assets),
+            },
+        )
+
+        async with AsyncSessionLocal() as session:
+            tx_repo = TransactionRepository(session)
+
+            if await tx_repo.exists_tx(event.tx_hash, event.log_index):
+                return
+
+            await tx_repo.create({
+                "tx_hash": event.tx_hash,
+                "block_number": event.block_number,
+                "log_index": event.log_index,
+                "block_timestamp": event.block_timestamp,
+                "event_type": "NavUpdated",
+                "contract_address": event.contract_address,
+                "amount": share_price,
+                "raw_data": event.raw_data,
+            })
+
+            await session.commit()
+
+            # Trigger metrics update task
+            from app.tasks.monitoring_tasks import sync_chain_data
+
+            sync_chain_data.delay()
+
+
+class PendingApprovalSharesAddedHandler(EventHandlerBase):
+    """Handler for PendingApprovalSharesAdded events.
+
+    待审批份额增加 - 用户发起需要审批的赎回请求时触发。
+    """
+
+    def __init__(self):
+        super().__init__(EventType.PENDING_APPROVAL_SHARES_ADDED)
+
+    async def handle(self, event: ParsedEvent) -> None:
+        """Handle PendingApprovalSharesAdded event."""
+        args = event.args
+        owner = args.get("owner", "").lower()
+        amount = Decimal(str(args.get("amount", 0)))
+
+        logger.info(
+            "Processing PendingApprovalSharesAdded event",
+            extra={
+                "tx_hash": event.tx_hash,
+                "owner": owner,
+                "amount": str(amount),
+            },
+        )
+
+        async with AsyncSessionLocal() as session:
+            tx_repo = TransactionRepository(session)
+
+            if await tx_repo.exists_tx(event.tx_hash, event.log_index):
+                return
+
+            await tx_repo.create({
+                "tx_hash": event.tx_hash,
+                "block_number": event.block_number,
+                "log_index": event.log_index,
+                "block_timestamp": event.block_timestamp,
+                "event_type": "PendingApprovalSharesAdded",
+                "contract_address": event.contract_address,
+                "from_address": owner,
+                "shares": amount,
+                "raw_data": event.raw_data,
+            })
+
+            await session.commit()
+
+
+class PendingApprovalSharesRemovedHandler(EventHandlerBase):
+    """Handler for PendingApprovalSharesRemoved events.
+
+    待审批份额移除 - 审批被拒绝或取消时触发。
+    """
+
+    def __init__(self):
+        super().__init__(EventType.PENDING_APPROVAL_SHARES_REMOVED)
+
+    async def handle(self, event: ParsedEvent) -> None:
+        """Handle PendingApprovalSharesRemoved event."""
+        args = event.args
+        owner = args.get("owner", "").lower()
+        amount = Decimal(str(args.get("amount", 0)))
+
+        logger.info(
+            "Processing PendingApprovalSharesRemoved event",
+            extra={
+                "tx_hash": event.tx_hash,
+                "owner": owner,
+                "amount": str(amount),
+            },
+        )
+
+        async with AsyncSessionLocal() as session:
+            tx_repo = TransactionRepository(session)
+
+            if await tx_repo.exists_tx(event.tx_hash, event.log_index):
+                return
+
+            await tx_repo.create({
+                "tx_hash": event.tx_hash,
+                "block_number": event.block_number,
+                "log_index": event.log_index,
+                "block_timestamp": event.block_timestamp,
+                "event_type": "PendingApprovalSharesRemoved",
+                "contract_address": event.contract_address,
+                "from_address": owner,
+                "shares": amount,
+                "raw_data": event.raw_data,
+            })
+
+            await session.commit()
+
+
+class SettlementWaterfallTriggeredHandler(EventHandlerBase):
+    """Handler for SettlementWaterfallTriggered events.
+
+    瀑布清算事件 - 当结算时流动性不足触发自动清算。
+    对应 03-risk-control.md 第5章。
+    """
+
+    def __init__(self):
+        super().__init__(EventType.SETTLEMENT_WATERFALL_TRIGGERED)
+
+    async def handle(self, event: ParsedEvent) -> None:
+        """Handle SettlementWaterfallTriggered event."""
+        args = event.args
+        request_id = Decimal(str(args.get("request_id", 0)))
+        shortfall = Decimal(str(args.get("shortfall", 0)))
+        liquidated = Decimal(str(args.get("liquidated", 0)))
+
+        logger.warning(
+            "WATERFALL LIQUIDATION TRIGGERED",
+            extra={
+                "tx_hash": event.tx_hash,
+                "request_id": str(request_id),
+                "shortfall": str(shortfall),
+                "liquidated": str(liquidated),
+            },
+        )
+
+        async with AsyncSessionLocal() as session:
+            tx_repo = TransactionRepository(session)
+            redemption_repo = RedemptionRepository(session)
+            risk_repo = RiskEventRepository(session)
+
+            if await tx_repo.exists_tx(event.tx_hash, event.log_index):
+                return
+
+            await tx_repo.create({
+                "tx_hash": event.tx_hash,
+                "block_number": event.block_number,
+                "log_index": event.log_index,
+                "block_timestamp": event.block_timestamp,
+                "event_type": "SettlementWaterfallTriggered",
+                "contract_address": event.contract_address,
+                "amount": liquidated,
+                "raw_data": event.raw_data,
+            })
+
+            # Update redemption with waterfall info
+            redemption = await redemption_repo.get_by_request_id(request_id)
+            if redemption:
+                await redemption_repo.update(
+                    redemption.id,
+                    {
+                        "waterfall_triggered": True,
+                        "waterfall_amount": liquidated,
+                    },
+                )
+
+            # Create risk event for monitoring
+            risk_event = await risk_repo.create_event(
+                event_type="WATERFALL_LIQUIDATION",
+                severity="warning",
+                metric_name="waterfall_liquidation",
+                message=f"Waterfall liquidation triggered: shortfall={shortfall}, liquidated={liquidated}",
+                details={
+                    "request_id": str(request_id),
+                    "shortfall": str(shortfall),
+                    "liquidated": str(liquidated),
+                },
+            )
+
+            await session.commit()
+
+            # Send alert
+            from app.tasks.notification_tasks import send_risk_alert
+
+            send_risk_alert.delay(event_id=risk_event.id)
+
+
+class DailyLiabilityAddedHandler(EventHandlerBase):
+    """Handler for DailyLiabilityAdded events.
+
+    每日负债记录 - 用于追踪未来 T+7 内的赎回负债。
+    对应 03-risk-control.md 第4章。
+    """
+
+    def __init__(self):
+        super().__init__(EventType.DAILY_LIABILITY_ADDED)
+
+    async def handle(self, event: ParsedEvent) -> None:
+        """Handle DailyLiabilityAdded event."""
+        args = event.args
+        day_index = int(args.get("day_index", 0))
+        amount = Decimal(str(args.get("amount", 0)))
+
+        logger.info(
+            "Processing DailyLiabilityAdded event",
+            extra={
+                "tx_hash": event.tx_hash,
+                "day_index": day_index,
+                "amount": str(amount),
+            },
+        )
+
+        async with AsyncSessionLocal() as session:
+            tx_repo = TransactionRepository(session)
+
+            if await tx_repo.exists_tx(event.tx_hash, event.log_index):
+                return
+
+            await tx_repo.create({
+                "tx_hash": event.tx_hash,
+                "block_number": event.block_number,
+                "log_index": event.log_index,
+                "block_timestamp": event.block_timestamp,
+                "event_type": "DailyLiabilityAdded",
+                "contract_address": event.contract_address,
+                "amount": amount,
+                "raw_data": event.raw_data,
+            })
+
+            await session.commit()
+
+
 def register_all_handlers(dispatcher: Any) -> None:
     """Register all event handlers with the dispatcher.
 
@@ -753,4 +1098,44 @@ def register_all_handlers(dispatcher: Any) -> None:
         RebalanceExecutedHandler(),
     )
 
-    logger.info("Registered all event handlers with persistence")
+    # =========================================================================
+    # v2.0.0 新增事件处理器
+    # =========================================================================
+
+    # NFT Voucher handler
+    dispatcher.register_handler(
+        EventType.VOUCHER_MINTED,
+        VoucherMintedHandler(),
+        priority=5,
+    )
+
+    # NAV update handler
+    dispatcher.register_handler(
+        EventType.NAV_UPDATED,
+        NavUpdatedHandler(),
+    )
+
+    # Pending approval shares handlers
+    dispatcher.register_handler(
+        EventType.PENDING_APPROVAL_SHARES_ADDED,
+        PendingApprovalSharesAddedHandler(),
+    )
+    dispatcher.register_handler(
+        EventType.PENDING_APPROVAL_SHARES_REMOVED,
+        PendingApprovalSharesRemovedHandler(),
+    )
+
+    # Waterfall liquidation handler (high priority for risk monitoring)
+    dispatcher.register_handler(
+        EventType.SETTLEMENT_WATERFALL_TRIGGERED,
+        SettlementWaterfallTriggeredHandler(),
+        priority=50,
+    )
+
+    # Daily liability handler
+    dispatcher.register_handler(
+        EventType.DAILY_LIABILITY_ADDED,
+        DailyLiabilityAddedHandler(),
+    )
+
+    logger.info("Registered all event handlers with persistence (including v2.0.0)")
