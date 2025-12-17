@@ -15,46 +15,195 @@ logger = logging.getLogger(__name__)
 
 
 class EventType(str, Enum):
-    """Supported event types."""
+    """Supported event types.
 
-    # Vault events
+    Updated for v2.0.0 contracts (PPT.sol, RedemptionManager.sol).
+    """
+
+    # =========================================================================
+    # ERC-4626 Vault Core Events
+    # =========================================================================
     DEPOSIT = "Deposit"
     WITHDRAW = "Withdraw"
 
-    # Redemption events
+    # =========================================================================
+    # Redemption Events (RedemptionManager.sol)
+    # =========================================================================
     REDEMPTION_REQUESTED = "RedemptionRequested"
     REDEMPTION_APPROVED = "RedemptionApproved"
     REDEMPTION_REJECTED = "RedemptionRejected"
     REDEMPTION_SETTLED = "RedemptionSettled"
-    REDEMPTION_CANCELLED = "RedemptionCancelled"
+    REDEMPTION_CANCELLED = "RedemptionCancelled"  # Note: Disabled in v2.0.0
 
-    # Emergency events
+    # =========================================================================
+    # PPT.sol Share Events (v2.0.0)
+    # =========================================================================
+    SHARES_LOCKED = "SharesLocked"
+    SHARES_UNLOCKED = "SharesUnlocked"
+    SHARES_BURNED = "SharesBurned"
+
+    # =========================================================================
+    # PPT.sol Fee Events (v2.0.0)
+    # =========================================================================
+    REDEMPTION_FEE_ADDED = "RedemptionFeeAdded"
+    REDEMPTION_FEE_REDUCED = "RedemptionFeeReduced"
+
+    # =========================================================================
+    # PPT.sol NAV Events (v2.0.0)
+    # =========================================================================
+    NAV_UPDATED = "NavUpdated"
+
+    # =========================================================================
+    # PPT.sol Emergency/Quota Events (v2.0.0)
+    # =========================================================================
     EMERGENCY_MODE_CHANGED = "EmergencyModeChanged"
+    EMERGENCY_QUOTA_REFRESHED = "EmergencyQuotaRefreshed"
+    EMERGENCY_QUOTA_RESTORED = "EmergencyQuotaRestored"
+    LOCKED_MINT_ASSETS_RESET = "LockedMintAssetsReset"
+    STANDARD_QUOTA_RATIO_UPDATED = "StandardQuotaRatioUpdated"
 
-    # Asset events
+    # =========================================================================
+    # PPT.sol Pending Approval Events (v2.0.0)
+    # =========================================================================
+    PENDING_APPROVAL_SHARES_ADDED = "PendingApprovalSharesAdded"
+    PENDING_APPROVAL_SHARES_REMOVED = "PendingApprovalSharesRemoved"
+    PENDING_APPROVAL_SHARES_CONVERTED = "PendingApprovalSharesConverted"
+
+    # =========================================================================
+    # PPT.sol Admin Events (v2.0.0)
+    # =========================================================================
+    ASSET_CONTROLLER_UPDATED = "AssetControllerUpdated"
+    REDEMPTION_MANAGER_UPDATED = "RedemptionManagerUpdated"
+
+    # =========================================================================
+    # RedemptionManager.sol NFT Voucher Events (v2.0.0)
+    # =========================================================================
+    VOUCHER_MINTED = "VoucherMinted"
+    VOUCHER_SETTLED = "VoucherSettled"
+
+    # =========================================================================
+    # RedemptionManager.sol Liability Events (v2.0.0)
+    # =========================================================================
+    DAILY_LIABILITY_ADDED = "DailyLiabilityAdded"
+    LIABILITY_REMOVED = "LiabilityRemoved"
+    SETTLEMENT_WATERFALL_TRIGGERED = "SettlementWaterfallTriggered"
+
+    # =========================================================================
+    # RedemptionManager.sol Config Events (v2.0.0)
+    # =========================================================================
+    BASE_REDEMPTION_FEE_UPDATED = "BaseRedemptionFeeUpdated"
+    EMERGENCY_PENALTY_FEE_UPDATED = "EmergencyPenaltyFeeUpdated"
+    VOUCHER_THRESHOLD_UPDATED = "VoucherThresholdUpdated"
+
+    # =========================================================================
+    # Asset Management Events
+    # =========================================================================
     ASSET_ADDED = "AssetAdded"
     ASSET_REMOVED = "AssetRemoved"
 
-    # Rebalancing events
+    # =========================================================================
+    # Rebalancing Events
+    # =========================================================================
     REBALANCE_EXECUTED = "RebalanceExecuted"
 
-    # Risk events
+    # =========================================================================
+    # Risk Alert Events (Backend-generated)
+    # =========================================================================
     LOW_LIQUIDITY_ALERT = "LowLiquidityAlert"
     CRITICAL_LIQUIDITY_ALERT = "CriticalLiquidityAlert"
 
 
 # Event signatures (keccak256 hash of event signature)
+# Updated for v2.0.0 contracts with correct parameter types
 EVENT_SIGNATURES = {
+    # =========================================================================
+    # ERC-4626 Core Events
+    # =========================================================================
     EventType.DEPOSIT: "Deposit(address,address,uint256,uint256)",
     EventType.WITHDRAW: "Withdraw(address,address,address,uint256,uint256)",
-    EventType.REDEMPTION_REQUESTED: "RedemptionRequested(uint256,address,address,uint256,uint256,uint8)",
-    EventType.REDEMPTION_APPROVED: "RedemptionApproved(uint256,address)",
+
+    # =========================================================================
+    # Redemption Events - v2.0.0 signatures
+    # RedemptionRequested has 10 params in v2.0.0
+    # =========================================================================
+    EventType.REDEMPTION_REQUESTED: (
+        "RedemptionRequested(uint256,address,address,uint256,uint256,"
+        "uint256,uint8,bool,uint256,uint256)"
+    ),
+    EventType.REDEMPTION_APPROVED: "RedemptionApproved(uint256,address,uint256)",
     EventType.REDEMPTION_REJECTED: "RedemptionRejected(uint256,address,string)",
     EventType.REDEMPTION_SETTLED: "RedemptionSettled(uint256,address,uint256,uint256)",
     EventType.REDEMPTION_CANCELLED: "RedemptionCancelled(uint256,address)",
+
+    # =========================================================================
+    # PPT.sol Share Events
+    # =========================================================================
+    EventType.SHARES_LOCKED: "SharesLocked(address,uint256,uint256)",
+    EventType.SHARES_UNLOCKED: "SharesUnlocked(address,uint256)",
+    EventType.SHARES_BURNED: "SharesBurned(address,uint256)",
+
+    # =========================================================================
+    # PPT.sol Fee Events
+    # =========================================================================
+    EventType.REDEMPTION_FEE_ADDED: "RedemptionFeeAdded(uint256)",
+    EventType.REDEMPTION_FEE_REDUCED: "RedemptionFeeReduced(uint256)",
+
+    # =========================================================================
+    # PPT.sol NAV Events
+    # =========================================================================
+    EventType.NAV_UPDATED: "NavUpdated(uint256,uint256,uint256)",
+
+    # =========================================================================
+    # PPT.sol Emergency/Quota Events
+    # =========================================================================
     EventType.EMERGENCY_MODE_CHANGED: "EmergencyModeChanged(bool,address)",
+    EventType.EMERGENCY_QUOTA_REFRESHED: "EmergencyQuotaRefreshed(uint256)",
+    EventType.EMERGENCY_QUOTA_RESTORED: "EmergencyQuotaRestored(uint256)",
+    EventType.LOCKED_MINT_ASSETS_RESET: "LockedMintAssetsReset(uint256)",
+    EventType.STANDARD_QUOTA_RATIO_UPDATED: "StandardQuotaRatioUpdated(uint256,uint256)",
+
+    # =========================================================================
+    # PPT.sol Pending Approval Events
+    # =========================================================================
+    EventType.PENDING_APPROVAL_SHARES_ADDED: "PendingApprovalSharesAdded(address,uint256)",
+    EventType.PENDING_APPROVAL_SHARES_REMOVED: "PendingApprovalSharesRemoved(address,uint256)",
+    EventType.PENDING_APPROVAL_SHARES_CONVERTED: "PendingApprovalSharesConverted(address,uint256)",
+
+    # =========================================================================
+    # PPT.sol Admin Events
+    # =========================================================================
+    EventType.ASSET_CONTROLLER_UPDATED: "AssetControllerUpdated(address,address)",
+    EventType.REDEMPTION_MANAGER_UPDATED: "RedemptionManagerUpdated(address,address)",
+
+    # =========================================================================
+    # RedemptionManager.sol NFT Voucher Events
+    # =========================================================================
+    EventType.VOUCHER_MINTED: "VoucherMinted(uint256,uint256,address)",
+    EventType.VOUCHER_SETTLED: "VoucherSettled(uint256,uint256,address,uint256)",
+
+    # =========================================================================
+    # RedemptionManager.sol Liability Events
+    # =========================================================================
+    EventType.DAILY_LIABILITY_ADDED: "DailyLiabilityAdded(uint256,uint256)",
+    EventType.LIABILITY_REMOVED: "LiabilityRemoved(uint256,uint256)",
+    EventType.SETTLEMENT_WATERFALL_TRIGGERED: "SettlementWaterfallTriggered(uint256,uint256,uint256)",
+
+    # =========================================================================
+    # RedemptionManager.sol Config Events
+    # =========================================================================
+    EventType.BASE_REDEMPTION_FEE_UPDATED: "BaseRedemptionFeeUpdated(uint256,uint256)",
+    EventType.EMERGENCY_PENALTY_FEE_UPDATED: "EmergencyPenaltyFeeUpdated(uint256,uint256)",
+    EventType.VOUCHER_THRESHOLD_UPDATED: "VoucherThresholdUpdated(uint256,uint256)",
+
+    # =========================================================================
+    # Asset Management Events
+    # =========================================================================
     EventType.ASSET_ADDED: "AssetAdded(address,uint8,uint256)",
     EventType.ASSET_REMOVED: "AssetRemoved(address)",
+
+    # =========================================================================
+    # Rebalancing Events
+    # =========================================================================
     EventType.REBALANCE_EXECUTED: "RebalanceExecuted(address,uint256)",
 }
 
@@ -167,13 +316,27 @@ class EventParser:
             return self._decode_deposit(topics, data)
         elif event_type == EventType.REDEMPTION_REQUESTED:
             return self._decode_redemption_requested(topics, data)
+        elif event_type == EventType.REDEMPTION_APPROVED:
+            return self._decode_redemption_approved(topics, data)
         elif event_type == EventType.REDEMPTION_SETTLED:
             return self._decode_redemption_settled(topics, data)
         elif event_type == EventType.EMERGENCY_MODE_CHANGED:
             return self._decode_emergency_mode_changed(topics, data)
+        elif event_type == EventType.VOUCHER_MINTED:
+            return self._decode_voucher_minted(topics, data)
+        elif event_type == EventType.NAV_UPDATED:
+            return self._decode_nav_updated(topics, data)
+        elif event_type == EventType.PENDING_APPROVAL_SHARES_ADDED:
+            return self._decode_pending_approval_shares(topics, data)
+        elif event_type == EventType.PENDING_APPROVAL_SHARES_REMOVED:
+            return self._decode_pending_approval_shares(topics, data)
+        elif event_type == EventType.SETTLEMENT_WATERFALL_TRIGGERED:
+            return self._decode_waterfall_triggered(topics, data)
+        elif event_type == EventType.DAILY_LIABILITY_ADDED:
+            return self._decode_daily_liability(topics, data)
         else:
             # Generic decode for other events
-            return {"raw_topics": topics, "raw_data": data.hex()}
+            return {"raw_topics": topics, "raw_data": data.hex() if data else ""}
 
     def _decode_deposit(
         self, topics: list, data: bytes
@@ -200,24 +363,61 @@ class EventParser:
     def _decode_redemption_requested(
         self, topics: list, data: bytes
     ) -> dict[str, Any]:
-        """Decode RedemptionRequested event."""
-        # RedemptionRequested(uint256 indexed requestId, address indexed owner, address receiver, uint256 shares, uint256 grossAmount, uint8 channel)
+        """Decode RedemptionRequested event.
+
+        v2.0.0 signature:
+        RedemptionRequested(
+            uint256 indexed requestId,
+            address indexed owner,
+            address receiver,
+            uint256 shares,
+            uint256 lockedAmount,
+            uint256 estimatedFee,
+            uint8 channel,
+            bool requiresApproval,
+            uint256 settlementTime,
+            uint256 windowId
+        )
+        """
         request_id = int(topics[1].hex(), 16) if len(topics) > 1 else 0
         owner = self._decode_address(topics[2]) if len(topics) > 2 else None
 
         if data:
-            decoded = decode(["address", "uint256", "uint256", "uint8"], data)
-            receiver, shares, gross_amount, channel = decoded
+            decoded = decode(
+                ["address", "uint256", "uint256", "uint256", "uint8", "bool", "uint256", "uint256"],
+                data,
+            )
+            (
+                receiver,
+                shares,
+                locked_amount,
+                estimated_fee,
+                channel,
+                requires_approval,
+                settlement_time,
+                window_id,
+            ) = decoded
         else:
-            receiver, shares, gross_amount, channel = None, 0, 0, 0
+            receiver = None
+            shares = 0
+            locked_amount = 0
+            estimated_fee = 0
+            channel = 0
+            requires_approval = False
+            settlement_time = 0
+            window_id = 0
 
         return {
             "request_id": request_id,
             "owner": owner,
             "receiver": receiver,
             "shares": shares,
-            "gross_amount": gross_amount,
+            "locked_amount": locked_amount,
+            "estimated_fee": estimated_fee,
             "channel": channel,
+            "requires_approval": requires_approval,
+            "settlement_time": settlement_time,
+            "window_id": window_id,
         }
 
     def _decode_redemption_settled(
@@ -255,6 +455,127 @@ class EventParser:
         return {
             "enabled": enabled,
             "triggered_by": triggered_by,
+        }
+
+    def _decode_redemption_approved(
+        self, topics: list, data: bytes
+    ) -> dict[str, Any]:
+        """Decode RedemptionApproved event.
+
+        v2.0.0: RedemptionApproved(uint256 indexed requestId, address indexed approver, uint256 settlementTime)
+        """
+        request_id = int(topics[1].hex(), 16) if len(topics) > 1 else 0
+        approver = self._decode_address(topics[2]) if len(topics) > 2 else None
+
+        if data:
+            decoded = decode(["uint256"], data)
+            settlement_time = decoded[0]
+        else:
+            settlement_time = 0
+
+        return {
+            "request_id": request_id,
+            "approver": approver,
+            "settlement_time": settlement_time,
+        }
+
+    def _decode_voucher_minted(
+        self, topics: list, data: bytes
+    ) -> dict[str, Any]:
+        """Decode VoucherMinted event.
+
+        VoucherMinted(uint256 indexed requestId, uint256 tokenId, address owner)
+        """
+        request_id = int(topics[1].hex(), 16) if len(topics) > 1 else 0
+
+        if data:
+            decoded = decode(["uint256", "address"], data)
+            token_id, owner = decoded
+        else:
+            token_id, owner = 0, None
+
+        return {
+            "request_id": request_id,
+            "token_id": token_id,
+            "owner": owner,
+        }
+
+    def _decode_nav_updated(
+        self, topics: list, data: bytes
+    ) -> dict[str, Any]:
+        """Decode NavUpdated event.
+
+        NavUpdated(uint256 newSharePrice, uint256 totalAssets, uint256 totalSupply)
+        """
+        if data:
+            decoded = decode(["uint256", "uint256", "uint256"], data)
+            share_price, total_assets, total_supply = decoded
+        else:
+            share_price, total_assets, total_supply = 0, 0, 0
+
+        return {
+            "share_price": share_price,
+            "total_assets": total_assets,
+            "total_supply": total_supply,
+        }
+
+    def _decode_pending_approval_shares(
+        self, topics: list, data: bytes
+    ) -> dict[str, Any]:
+        """Decode PendingApprovalShares events.
+
+        PendingApprovalSharesAdded/Removed(address indexed owner, uint256 amount)
+        """
+        owner = self._decode_address(topics[1]) if len(topics) > 1 else None
+
+        if data:
+            decoded = decode(["uint256"], data)
+            amount = decoded[0]
+        else:
+            amount = 0
+
+        return {
+            "owner": owner,
+            "amount": amount,
+        }
+
+    def _decode_waterfall_triggered(
+        self, topics: list, data: bytes
+    ) -> dict[str, Any]:
+        """Decode SettlementWaterfallTriggered event.
+
+        SettlementWaterfallTriggered(uint256 indexed requestId, uint256 shortfall, uint256 liquidated)
+        """
+        request_id = int(topics[1].hex(), 16) if len(topics) > 1 else 0
+
+        if data:
+            decoded = decode(["uint256", "uint256"], data)
+            shortfall, liquidated = decoded
+        else:
+            shortfall, liquidated = 0, 0
+
+        return {
+            "request_id": request_id,
+            "shortfall": shortfall,
+            "liquidated": liquidated,
+        }
+
+    def _decode_daily_liability(
+        self, topics: list, data: bytes
+    ) -> dict[str, Any]:
+        """Decode DailyLiabilityAdded event.
+
+        DailyLiabilityAdded(uint256 dayIndex, uint256 amount)
+        """
+        if data:
+            decoded = decode(["uint256", "uint256"], data)
+            day_index, amount = decoded
+        else:
+            day_index, amount = 0, 0
+
+        return {
+            "day_index": day_index,
+            "amount": amount,
         }
 
     def _decode_address(self, topic: Any) -> str:

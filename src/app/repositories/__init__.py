@@ -12,6 +12,7 @@ from app.repositories.rebalance import RebalanceRepository
 from app.repositories.transaction import TransactionRepository
 from app.repositories.risk_event import RiskEventRepository
 from app.repositories.audit_log import AuditLogRepository
+from app.repositories.snapshot import DailySnapshotRepository, RiskMetricsRepository
 
 __all__ = [
     "BaseRepository",
@@ -23,4 +24,6 @@ __all__ = [
     "TransactionRepository",
     "RiskEventRepository",
     "AuditLogRepository",
+    "DailySnapshotRepository",
+    "RiskMetricsRepository",
 ]

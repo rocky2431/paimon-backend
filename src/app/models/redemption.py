@@ -82,6 +82,34 @@ class RedemptionRequest(Base, TimestampMixin):
     )
     rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # === v2.0.0 新增字段 ===
+
+    # NFT Voucher info (当 settlementDelay > voucherThreshold 时铸造)
+    voucher_token_id: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(78, 0), nullable=True, comment="NFT Voucher Token ID"
+    )
+    has_voucher: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, comment="是否已铸造 NFT Voucher"
+    )
+
+    # Pending approval shares snapshot (待审批时锁定的份额快照)
+    pending_approval_shares: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(78, 0), nullable=True, comment="待审批份额快照 (来自 PPT.pendingApprovalSharesOf)"
+    )
+
+    # Waterfall liquidation info (瀑布清算信息)
+    waterfall_triggered: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, comment="是否触发瀑布清算"
+    )
+    waterfall_amount: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(78, 0), nullable=True, comment="瀑布清算金额"
+    )
+
+    # On-chain execution tracking
+    approval_tx_hash: Mapped[Optional[str]] = mapped_column(
+        String(66), nullable=True, comment="链上审批交易哈希"
+    )
+
     __table_args__ = (
         UniqueConstraint("tx_hash", "log_index", name="uq_redemption_tx"),
         CheckConstraint(

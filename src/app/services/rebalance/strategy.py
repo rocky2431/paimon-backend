@@ -34,25 +34,25 @@ class RebalanceStrategyEngine:
     - Multi-tier rebalancing support
     """
 
-    # Default tier configurations
+    # Default tier configurations (v2.0.0: L1=10%, L2=30%, L3=60%)
     DEFAULT_TIER_CONFIGS: dict[LiquidityTier, TierConfig] = {
         LiquidityTier.L1: TierConfig(
             tier=LiquidityTier.L1,
-            target_ratio=Decimal("0.115"),  # 11.5% (middle of 8-15%)
+            target_ratio=Decimal("0.10"),  # 10% (v2.0.0 标准配比)
             min_ratio=Decimal("0.08"),
             max_ratio=Decimal("0.15"),
             rebalance_threshold=Decimal("0.02"),
         ),
         LiquidityTier.L2: TierConfig(
             tier=LiquidityTier.L2,
-            target_ratio=Decimal("0.30"),  # 30% (middle of 25-35%)
+            target_ratio=Decimal("0.30"),  # 30% (v2.0.0 标准配比)
             min_ratio=Decimal("0.25"),
             max_ratio=Decimal("0.35"),
             rebalance_threshold=Decimal("0.03"),
         ),
         LiquidityTier.L3: TierConfig(
             tier=LiquidityTier.L3,
-            target_ratio=Decimal("0.585"),  # 58.5% (middle of 55-65%)
+            target_ratio=Decimal("0.60"),  # 60% (v2.0.0 标准配比)
             min_ratio=Decimal("0.55"),
             max_ratio=Decimal("0.65"),
             rebalance_threshold=Decimal("0.03"),

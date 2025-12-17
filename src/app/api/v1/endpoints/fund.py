@@ -1,12 +1,25 @@
-"""Fund overview API endpoints."""
+"""Fund overview API endpoints.
 
+This module provides Fund API endpoints with hybrid mock/real data sources.
+Data sources are controlled via Feature Flags in config.py.
+"""
+
+import logging
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import get_settings
+from app.infrastructure.database.session import get_async_db
+from app.services.fund import FundService, FundMetricsService
+
+logger = logging.getLogger(__name__)
+settings = get_settings()
 
 router = APIRouter(prefix="/fund", tags=["Fund Overview"])
 
@@ -375,10 +388,13 @@ def _generate_flow_metrics() -> FlowMetrics:
 
 # Endpoints
 @router.get("/overview", response_model=FundOverview)
-async def get_fund_overview() -> FundOverview:
+async def get_fund_overview(
+    db: AsyncSession = Depends(get_async_db),
+) -> FundOverview:
     """Get fund overview.
 
     Returns AUM, NAV, supply, and holder information.
+    Uses FF_FUND_OVERVIEW_SOURCE feature flag.
     Cached for 60 seconds.
     """
     cache_key = "fund:overview"
@@ -386,16 +402,37 @@ async def get_fund_overview() -> FundOverview:
     if cached:
         return cached
 
-    data = _generate_fund_overview()
+    # Use FundService with hybrid data source
+    fund_service = FundService(session=db)
+    overview_data = await fund_service.get_fund_overview()
+
+    # Convert to FundOverview model
+    data = FundOverview(
+        fund_name="Paimon Prime Fund",
+        fund_symbol="PPF",
+        total_aum=Decimal(overview_data["total_aum"]),
+        current_nav=Decimal(overview_data["current_nav"]),
+        nav_24h_change=Decimal("0.0012"),  # TODO: Calculate from history
+        nav_7d_change=Decimal("0.0078"),   # TODO: Calculate from history
+        nav_30d_change=Decimal("0.0234"),  # TODO: Calculate from history
+        total_supply=Decimal(overview_data["total_supply"]),
+        holder_count=1250,  # TODO: Get from chain events
+        inception_date=date(2024, 1, 15),
+        last_updated=datetime.now(timezone.utc),
+    )
+
     _cache.set(cache_key, data, ttl_seconds=60)
     return data
 
 
 @router.get("/yields", response_model=YieldMetrics)
-async def get_yield_metrics() -> YieldMetrics:
+async def get_yield_metrics(
+    db: AsyncSession = Depends(get_async_db),
+) -> YieldMetrics:
     """Get yield metrics.
 
     Returns APY across different time periods.
+    Uses FF_YIELD_METRICS_SOURCE feature flag.
     Cached for 5 minutes.
     """
     cache_key = "fund:yields"
@@ -403,7 +440,19 @@ async def get_yield_metrics() -> YieldMetrics:
     if cached:
         return cached
 
-    data = _generate_yield_metrics()
+    # Use FundMetricsService with hybrid data source
+    metrics_service = FundMetricsService(session=db)
+    yield_data = await metrics_service.get_yield_metrics()
+
+    data = YieldMetrics(
+        apy_7d=Decimal(yield_data["apy_7d"]),
+        apy_30d=Decimal(yield_data["apy_30d"]),
+        apy_90d=Decimal(yield_data["apy_90d"]),
+        apy_ytd=Decimal(yield_data.get("apy_365d", yield_data["apy_90d"])),
+        cumulative_yield=Decimal(yield_data.get("apy_365d", yield_data["apy_90d"])),
+        next_distribution_date=date.today() + timedelta(days=15),
+    )
+
     _cache.set(cache_key, data, ttl_seconds=300)
     return data
 
@@ -411,10 +460,12 @@ async def get_yield_metrics() -> YieldMetrics:
 @router.get("/nav/history", response_model=NAVHistory)
 async def get_nav_history(
     time_range: TimeRange = Query(TimeRange.MONTH_1, description="Time range"),
+    db: AsyncSession = Depends(get_async_db),
 ) -> NAVHistory:
     """Get NAV history.
 
     Returns historical NAV data points for charting.
+    Uses FF_NAV_HISTORY_SOURCE feature flag.
     Cached for 5 minutes.
     """
     cache_key = f"fund:nav:{time_range.value}"
@@ -422,16 +473,65 @@ async def get_nav_history(
     if cached:
         return cached
 
-    data = _generate_nav_history(time_range)
+    # Map time range to days
+    days_map = {
+        TimeRange.DAY_1: 1,
+        TimeRange.WEEK_1: 7,
+        TimeRange.MONTH_1: 30,
+        TimeRange.MONTH_3: 90,
+        TimeRange.MONTH_6: 180,
+        TimeRange.YEAR_1: 365,
+        TimeRange.ALL: 730,
+    }
+    days = days_map.get(time_range, 30)
+
+    # Use FundService with hybrid data source
+    fund_service = FundService(session=db)
+    nav_data = await fund_service.get_nav_history(days=days)
+
+    if not nav_data:
+        # Fallback to mock if no data
+        data = _generate_nav_history(time_range)
+    else:
+        # Convert to NAVHistory model
+        base_aum = Decimal("25000000")
+        data_points = [
+            NAVDataPoint(
+                timestamp=datetime.fromisoformat(point["time"].replace("Z", "+00:00"))
+                if isinstance(point["time"], str)
+                else point["time"],
+                nav=Decimal(point["nav"]),
+                aum=base_aum * Decimal(point["nav"]),
+            )
+            for point in nav_data
+        ]
+
+        navs = [dp.nav for dp in data_points]
+        base_nav = Decimal("1.00")
+        data = NAVHistory(
+            time_range=time_range,
+            start_nav=navs[0] if navs else base_nav,
+            end_nav=navs[-1] if navs else base_nav,
+            high_nav=max(navs) if navs else base_nav,
+            low_nav=min(navs) if navs else base_nav,
+            change_percent=((navs[-1] - navs[0]) / navs[0] * 100)
+            if navs and navs[0] != 0
+            else Decimal(0),
+            data_points=data_points,
+        )
+
     _cache.set(cache_key, data, ttl_seconds=300)
     return data
 
 
 @router.get("/allocations/assets", response_model=list[AssetAllocation])
-async def get_asset_allocations() -> list[AssetAllocation]:
+async def get_asset_allocations(
+    db: AsyncSession = Depends(get_async_db),
+) -> list[AssetAllocation]:
     """Get asset allocations.
 
     Returns detailed breakdown of fund assets.
+    Uses FF_ASSET_ALLOCATION_SOURCE feature flag.
     Cached for 5 minutes.
     """
     cache_key = "fund:allocations:assets"
@@ -439,16 +539,37 @@ async def get_asset_allocations() -> list[AssetAllocation]:
     if cached:
         return cached
 
-    data = _generate_asset_allocations()
+    # Use FundService with hybrid data source
+    fund_service = FundService(session=db)
+    assets_data = await fund_service.get_asset_allocations()
+
+    # Convert to AssetAllocation models
+    data = [
+        AssetAllocation(
+            asset_name=asset.get("asset_name", asset["asset_symbol"]),
+            asset_symbol=asset["asset_symbol"],
+            value=Decimal("0"),  # Actual value needs chain data
+            allocation_percent=Decimal(asset["allocation_percent"]),
+            chain="BSC",
+            protocol=None,
+            apy=None,
+            liquidity_tier=asset["liquidity_tier"],
+        )
+        for asset in assets_data
+    ]
+
     _cache.set(cache_key, data, ttl_seconds=300)
     return data
 
 
 @router.get("/allocations/tiers", response_model=list[TierAllocation])
-async def get_tier_allocations() -> list[TierAllocation]:
+async def get_tier_allocations(
+    db: AsyncSession = Depends(get_async_db),
+) -> list[TierAllocation]:
     """Get liquidity tier allocations.
 
     Returns allocation breakdown by liquidity tier.
+    Uses FF_TIER_ALLOCATION_SOURCE feature flag.
     Cached for 5 minutes.
     """
     cache_key = "fund:allocations:tiers"
@@ -456,7 +577,30 @@ async def get_tier_allocations() -> list[TierAllocation]:
     if cached:
         return cached
 
-    data = _generate_tier_allocations()
+    # Use FundService with hybrid data source
+    fund_service = FundService(session=db)
+    tier_data = await fund_service.get_tier_allocations()
+
+    # Convert to TierAllocation models
+    data = []
+    for tier_name in ["L1", "L2", "L3"]:
+        tier_info = tier_data.get(tier_name, {})
+        allocation = Decimal(tier_info.get("allocation_percent", "0"))
+        # Use target allocation as baseline (can be adjusted)
+        target = {"L1": Decimal("35"), "L2": Decimal("40"), "L3": Decimal("25")}.get(
+            tier_name, Decimal("0")
+        )
+        data.append(
+            TierAllocation(
+                tier=tier_name,
+                value=Decimal("0"),  # Actual value needs chain data
+                allocation_percent=allocation,
+                asset_count=tier_info.get("asset_count", 0),
+                target_percent=target,
+                deviation=allocation - target,
+            )
+        )
+
     _cache.set(cache_key, data, ttl_seconds=300)
     return data
 
@@ -479,10 +623,13 @@ async def get_fee_structure() -> FeeStructure:
 
 
 @router.get("/performance", response_model=PerformanceMetrics)
-async def get_performance_metrics() -> PerformanceMetrics:
+async def get_performance_metrics(
+    db: AsyncSession = Depends(get_async_db),
+) -> PerformanceMetrics:
     """Get performance metrics.
 
     Returns returns, volatility, and risk-adjusted metrics.
+    Uses FF_YIELD_METRICS_SOURCE feature flag.
     Cached for 5 minutes.
     """
     cache_key = "fund:performance"
@@ -490,16 +637,34 @@ async def get_performance_metrics() -> PerformanceMetrics:
     if cached:
         return cached
 
-    data = _generate_performance_metrics()
+    # Use FundMetricsService with hybrid data source
+    metrics_service = FundMetricsService(session=db)
+    perf_data = await metrics_service.get_performance_metrics()
+
+    data = PerformanceMetrics(
+        return_1d=Decimal(perf_data.get("return_1d", "0")),
+        return_7d=Decimal(perf_data["return_7d"]),
+        return_30d=Decimal(perf_data["return_30d"]),
+        return_90d=Decimal(perf_data["return_90d"]),
+        return_ytd=Decimal(perf_data["return_ytd"]),
+        return_inception=Decimal(perf_data["return_ytd"]),
+        volatility_30d=Decimal(perf_data["volatility_30d"]),
+        sharpe_ratio=Decimal(perf_data["sharpe_ratio"]),
+        max_drawdown=Decimal(perf_data["max_drawdown_90d"]),
+    )
+
     _cache.set(cache_key, data, ttl_seconds=300)
     return data
 
 
 @router.get("/flows", response_model=FlowMetrics)
-async def get_flow_metrics() -> FlowMetrics:
+async def get_flow_metrics(
+    db: AsyncSession = Depends(get_async_db),
+) -> FlowMetrics:
     """Get fund flow metrics.
 
     Returns subscription and redemption flow data.
+    Uses FF_FLOW_METRICS_SOURCE feature flag.
     Cached for 1 minute.
     """
     cache_key = "fund:flows"
@@ -507,7 +672,25 @@ async def get_flow_metrics() -> FlowMetrics:
     if cached:
         return cached
 
-    data = _generate_flow_metrics()
+    # Use FundService with hybrid data source
+    fund_service = FundService(session=db)
+    flow_data = await fund_service.get_flow_metrics()
+
+    # Convert to FlowMetrics model
+    decimals = Decimal(10**18)
+    data = FlowMetrics(
+        subscriptions_24h=Decimal(flow_data["subscriptions_24h"]) / decimals,
+        redemptions_24h=Decimal(flow_data["redemptions_24h"]) / decimals,
+        net_flow_24h=Decimal(flow_data["net_flow_24h"]) / decimals,
+        subscriptions_7d=Decimal(flow_data["subscriptions_7d"]) / decimals,
+        redemptions_7d=Decimal(flow_data["redemptions_7d"]) / decimals,
+        net_flow_7d=Decimal(flow_data.get("net_flow_7d", "0")) / decimals
+        if flow_data.get("net_flow_7d")
+        else Decimal(flow_data["subscriptions_7d"]) / decimals
+        - Decimal(flow_data["redemptions_7d"]) / decimals,
+        pending_redemptions=Decimal(flow_data["pending_redemptions"]) / decimals,
+    )
+
     _cache.set(cache_key, data, ttl_seconds=60)
     return data
 
@@ -539,15 +722,17 @@ async def invalidate_cache(keys: list[str] | None = None) -> dict[str, Any]:
 
 
 @router.get("/summary")
-async def get_fund_summary() -> dict[str, Any]:
+async def get_fund_summary(
+    db: AsyncSession = Depends(get_async_db),
+) -> dict[str, Any]:
     """Get complete fund summary.
 
     Returns overview, yields, performance, and flows in one call.
     """
     overview = await get_fund_overview()
-    yields = await get_yield_metrics()
-    performance = await get_performance_metrics()
-    flows = await get_flow_metrics()
+    yields = await get_yield_metrics(db=db)
+    performance = await get_performance_metrics(db=db)
+    flows = await get_flow_metrics(db=db)
 
     return {
         "overview": overview.model_dump(),
